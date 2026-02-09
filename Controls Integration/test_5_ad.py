@@ -4,38 +4,47 @@ import time
 class MotorController:
     """Simple velocity control for stepper motor via driver (STEP/DIR)."""
 
-    def __init__(self, pul_pin, dir_pin, steps_per_rev=200, microsteps=8, pwm_start_hz=100):
+    def __init__(self, pul_pin, dir_pin, steps_per_rev=200, microsteps=8, gear_ratio=4.0):
         self.pul_pin = pul_pin
         self.dir_pin = dir_pin
-        self.steps_per_rev = steps_per_rev * microsteps  # effective steps per rev at microstepping
+        self.steps_per_rev = steps_per_rev * microsteps  # 1600 steps/rev
+        self.gear_ratio = gear_ratio  # 4:1 gearbox
+        
+        # Safety limits
+        self.max_motor_rpm = 700  # Slightly above your 675 RPM requirement
+        self.max_pulse_freq = (self.max_motor_rpm * self.steps_per_rev) / 60.0  # ~18.7 kHz
 
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(self.pul_pin, GPIO.OUT, initial=GPIO.LOW)
         GPIO.setup(self.dir_pin, GPIO.OUT, initial=GPIO.LOW)
 
-        # Create ONE PWM instance for this pin (RPi.GPIO requires this)
-        self.pwm = GPIO.PWM(self.pul_pin, pwm_start_hz)
+        # Create ONE PWM instance
+        self.pwm = GPIO.PWM(self.pul_pin, 100)
         self.pwm_running = False
 
-    def set_velocity(self, velocity_rpm):
+    def set_velocity_rpm(self, motor_rpm):
         """
-        Set motor velocity in RPM
+        Set motor velocity in RPM (at motor shaft, before gearbox)
         Args:
-            velocity_rpm: speed in RPM (positive or negative for direction)
+            motor_rpm: motor speed in RPM (positive or negative for direction)
         """
         # Stop if too slow
-        if abs(velocity_rpm) < 1:
+        if abs(motor_rpm) < 1:
             self.stop()
             return
 
         # Direction
-        GPIO.output(self.dir_pin, GPIO.HIGH if velocity_rpm > 0 else GPIO.LOW)
+        GPIO.output(self.dir_pin, GPIO.HIGH if motor_rpm > 0 else GPIO.LOW)
 
         # Calculate pulse frequency (Hz)
-        freq = abs(velocity_rpm) * self.steps_per_rev / 60.0
-        freq = min(freq, 10000)  # Cap at 10 kHz
+        freq = abs(motor_rpm) * self.steps_per_rev / 60.0
+        
+        # Safety limit based on motor capability, not arbitrary cap
+        freq = min(freq, self.max_pulse_freq)  # Now ~18.7 kHz instead of 10 kHz!
+        
+        output_rpm = abs(motor_rpm) / self.gear_ratio
 
-        print(f"Commanding {velocity_rpm} RPM -> {freq:.1f} Hz")
+        print(f"Motor: {motor_rpm} RPM → Output: {output_rpm:.1f} RPM → Freq: {freq:.0f} Hz")
 
         # Update PWM safely
         if not self.pwm_running:
@@ -43,16 +52,11 @@ class MotorController:
             self.pwm_running = True
 
         self.pwm.ChangeFrequency(freq)
-        self.pwm.ChangeDutyCycle(50)
 
     def stop(self):
         if self.pwm_running:
-            # Either stop PWM entirely, or set duty to 0
-            self.pwm.ChangeDutyCycle(0)
             self.pwm.stop()
             self.pwm_running = False
-
-        # Ensure STEP is low
         GPIO.output(self.pul_pin, GPIO.LOW)
 
     def cleanup(self):
@@ -61,30 +65,36 @@ class MotorController:
         finally:
             GPIO.cleanup()
 
-# Test script
+
+# Test script to hit your target speeds
 if __name__ == "__main__":
-    motor = MotorController(pul_pin=4, dir_pin=17, microsteps=8)
+    motor = MotorController(pul_pin=4, dir_pin=17, microsteps=8, gear_ratio=4.0)
 
     try:
-        print("Testing motor control with more dramatic speed differences...\n")
+        print("Testing motor speeds up to 675 RPM...\n")
 
-        print("=== 100 RPM (very slow) ===")
-        motor.set_velocity(100)
-        time.sleep(4)
+        print("=== 100 RPM motor (25 RPM output) ===")
+        motor.set_velocity_rpm(100)
+        time.sleep(3)
 
-        print("\n=== 400 RPM (medium) ===")
-        motor.set_velocity(400)
-        time.sleep(4)
+        print("\n=== 300 RPM motor (75 RPM output) ===")
+        motor.set_velocity_rpm(300)
+        time.sleep(3)
 
-        print("\n=== 1000 RPM (fast) ===")
-        motor.set_velocity(1000)
-        time.sleep(10)
+        print("\n=== 500 RPM motor (125 RPM output) ===")
+        motor.set_velocity_rpm(500)
+        time.sleep(3)
 
+        print("\n=== 675 RPM motor (168.75 RPM output) - TARGET SPEED! ===")
+        motor.set_velocity_rpm(675)
+        time.sleep(5)
         
+        print("\n=== Reverse at 400 RPM ===")
+        motor.set_velocity_rpm(-400)
+        time.sleep(3)
 
         print("\n=== Stopping ===")
         motor.stop()
-        time.sleep(1)
 
     except KeyboardInterrupt:
         print("\nStopped by user")
