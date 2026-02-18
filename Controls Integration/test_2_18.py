@@ -20,14 +20,14 @@ PUL_PIN = 22   # Purple - Step pulse
 
 # ── Motion parameters ─────────────────────────────────────────────────────────
 STEPS_PER_REV     = 200        # 1.8 deg motor
-MICROSTEP         = 8          # Match CL42T SW switch setting
+MICROSTEP         = 4          # Match CL42T SW switch setting
 COUNTS_PER_REV    = 4000       # 1000 PPR encoder x4 quadrature
 GEAR_RATIO        = 4.0        # Bridge motor gearbox
 WHEEL_RADIUS_IN   = 0.5        # Estimate - update with actual value
 
 TEST_SPEED_HZ     = 400        # Pulse frequency (steps/sec) - start slow
 PULSE_HALF_PERIOD = 1.0 / (2 * TEST_SPEED_HZ)
-TEST_STEPS        = 400        # Steps per direction run (~1 rev at 8x microstep)
+TEST_STEPS        = 1600        # Steps per direction run (~1 rev at 8x microstep)
 LOG_INTERVAL      = 0.05       # Encoder read every 50ms
 
 # ── LS7366R SPI commands ──────────────────────────────────────────────────────
@@ -101,7 +101,7 @@ def step_motor(steps, direction, spi, log_writer, commanded_total):
     Returns updated commanded_total
     """
     GPIO.output(DIR_PIN, direction)
-    time.sleep(0.000002)   # DIR setup time >= 2us per CL42T spec
+    time.sleep(0.01)   # DIR setup time >= 2us per CL42T spec (editing from 0.000002 to 0.01))
 
     last_log_time = time.time()
     dir_sign = 1 if direction == GPIO.HIGH else -1
@@ -138,7 +138,7 @@ def step_motor(steps, direction, spi, log_writer, commanded_total):
 
 def run_test():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = f"/home/pi/crane_test_{timestamp}.csv"
+    log_path = f"/home/team11/crane_test_{timestamp}.csv"
 
     print("=" * 55)
     print("  UHplift Bridge Motor 1 - Open Loop Test")
@@ -211,6 +211,7 @@ def run_test():
             GPIO.cleanup()
             spi.close()
             print("[CLEANUP] GPIO and SPI released.")
+    
 
 
 if __name__ == "__main__":
