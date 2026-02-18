@@ -20,14 +20,14 @@ PUL_PIN = 22   # Purple - Step pulse
 
 # ── Motion parameters ─────────────────────────────────────────────────────────
 STEPS_PER_REV     = 200        # 1.8 deg motor
-MICROSTEP         = 4          # Match CL42T SW switch setting
+MICROSTEP         = 4          # CL42T SW setting: 4x = 800 steps/rev
 COUNTS_PER_REV    = 4000       # 1000 PPR encoder x4 quadrature
 GEAR_RATIO        = 4.0        # Bridge motor gearbox
 WHEEL_RADIUS_IN   = 0.5        # Estimate - update with actual value
 
-TEST_SPEED_HZ     = 400        # Pulse frequency (steps/sec) - start slow
+TEST_SPEED_HZ     = 400        # Pulse frequency (steps/sec)
 PULSE_HALF_PERIOD = 1.0 / (2 * TEST_SPEED_HZ)
-TEST_STEPS        = 1600        # Steps per direction run (~1 rev at 8x microstep)
+TEST_STEPS        = 800        # 800 steps = 1 full revolution at 4x microstep
 LOG_INTERVAL      = 0.05       # Encoder read every 50ms
 
 # ── LS7366R SPI commands ──────────────────────────────────────────────────────
@@ -77,7 +77,6 @@ def init_encoder(spi):
 def read_encoder(spi):
     """Read 32-bit counter. Returns signed count."""
     raw = spi.xfer2([CMD_RD_CNTR, 0x00, 0x00, 0x00, 0x00])
-    # raw[0] is status byte from CMD, bytes 1-4 are counter
     count = (raw[1] << 24) | (raw[2] << 16) | (raw[3] << 8) | raw[4]
     # Convert to signed 32-bit
     if count >= 0x80000000:
@@ -89,7 +88,6 @@ def counts_to_inches(counts):
     """Convert encoder counts to linear travel in inches."""
     shaft_revs = counts / COUNTS_PER_REV
     output_revs = shaft_revs / GEAR_RATIO
-    # circumference = 2 * pi * r, but using wheel_radius for rack/pinion or wheel drive
     travel_in = output_revs * 2 * 3.14159 * WHEEL_RADIUS_IN
     return travel_in
 
@@ -97,17 +95,16 @@ def counts_to_inches(counts):
 def step_motor(steps, direction, spi, log_writer, commanded_total):
     """
     Step motor N steps in given direction with encoder logging.
-    direction: GPIO.HIGH or GPIO.LOW
-    Returns updated commanded_total
+    direction: GPIO.HIGH = forward, GPIO.LOW = reverse
+    Returns updated commanded_total.
     """
     GPIO.output(DIR_PIN, direction)
-    time.sleep(0.01)   # DIR setup time >= 2us per CL42T spec (editing from 0.000002 to 0.01))
+    time.sleep(0.01)                  # 10ms DIR setup - accounts for OS jitter
 
     last_log_time = time.time()
     dir_sign = 1 if direction == GPIO.HIGH else -1
 
     for i in range(steps):
-        # Pulse
         GPIO.output(PUL_PIN, GPIO.HIGH)
         time.sleep(PULSE_HALF_PERIOD)
         GPIO.output(PUL_PIN, GPIO.LOW)
@@ -115,7 +112,6 @@ def step_motor(steps, direction, spi, log_writer, commanded_total):
 
         commanded_total += dir_sign
 
-        # Log at interval
         now = time.time()
         if now - last_log_time >= LOG_INTERVAL:
             enc_count = read_encoder(spi)
@@ -138,15 +134,17 @@ def step_motor(steps, direction, spi, log_writer, commanded_total):
 
 def run_test():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = f"/home/team11/crane_test_{timestamp}.csv"
+    log_path = os.path.join(
+        os.path.expanduser("~"),
+        f"crane_test_{timestamp}.csv"
+    )
 
     print("=" * 55)
     print("  UHplift Bridge Motor 1 - Open Loop Test")
-    print(f"  Speed: {TEST_SPEED_HZ} Hz | Steps/run: {TEST_STEPS}")
+    print(f"  Speed: {TEST_SPEED_HZ} Hz | Steps/run: {TEST_STEPS} (1 rev)")
     print(f"  Log: {log_path}")
     print("=" * 55)
 
-    # Init SPI - hardware SPI0, CE0
     spi = spidev.SpiDev()
     spi.open(0, 0)                    # Bus 0, Device 0 (CE0)
     spi.max_speed_hz = 1000000        # 1 MHz - conservative for first test
@@ -173,34 +171,26 @@ def run_test():
             enable_driver()
             time.sleep(0.5)
 
-            # ── Run 1: Forward ────────────────────────────────────────────
-            print(f"\n[RUN 1] Forward {TEST_STEPS} steps...")
+            # ── Run 1: Forward one full revolution ────────────────────────
+            print(f"\n[RUN 1] Forward {TEST_STEPS} steps (1 revolution)...")
             commanded_total = step_motor(
                 TEST_STEPS, GPIO.HIGH, spi, writer, commanded_total
             )
             enc = read_encoder(spi)
             print(f"  Commanded: {commanded_total} steps | Encoder: {enc} counts")
 
-            time.sleep(1.0)   # Pause between directions
+            time.sleep(1.0)
 
-            # ── Run 2: Reverse ────────────────────────────────────────────
-            print(f"\n[RUN 2] Reverse {TEST_STEPS} steps...")
+            # ── Run 2: Reverse one full revolution ────────────────────────
+            print(f"\n[RUN 2] Reverse {TEST_STEPS} steps (1 revolution)...")
             commanded_total = step_motor(
                 TEST_STEPS, GPIO.LOW, spi, writer, commanded_total
             )
             enc = read_encoder(spi)
             print(f"  Commanded: {commanded_total} steps | Encoder: {enc} counts")
 
-            time.sleep(1.0)
-
-            # ── Run 3: Forward again ──────────────────────────────────────
-            print(f"\n[RUN 3] Forward {TEST_STEPS * 2} steps...")
-            commanded_total = step_motor(
-                TEST_STEPS * 2, GPIO.HIGH, spi, writer, commanded_total
-            )
-            enc = read_encoder(spi)
-            print(f"  Commanded: {commanded_total} steps | Encoder: {enc} counts")
-
+            net = read_encoder(spi)
+            print(f"\n  Net encoder count (should be ~0): {net}")
             print(f"\n[DONE] Log saved to {log_path}")
 
         except KeyboardInterrupt:
@@ -211,7 +201,6 @@ def run_test():
             GPIO.cleanup()
             spi.close()
             print("[CLEANUP] GPIO and SPI released.")
-    
 
 
 if __name__ == "__main__":
