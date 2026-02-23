@@ -184,7 +184,7 @@ def run_test():
             # ── Run 1: Forward one full revolution ────────────────────────
             print(f"\n[RUN 1] Forward {TEST_STEPS} steps (1 revolution)...")
             commanded_total, run1_data = step_motor(
-                TEST_STEPS, GPIO.HIGH, spi, commanded_total
+                TEST_STEPS, GPIO.LOW, spi, commanded_total
             )
             writer.writerows(run1_data)
             enc = read_encoder(spi)
