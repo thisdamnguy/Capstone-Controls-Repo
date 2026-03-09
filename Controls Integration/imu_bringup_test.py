@@ -1,3 +1,12 @@
+#Before running, enable SPI1 and reboot:
+
+#echo "dtoverlay=spi1-3cs" | sudo tee -a /boot/config.txt
+#sudo reboot
+
+#Then verify:
+#ls /dev/spidev1*
+# should show /dev/spidev1.0
+
 !/usr/bin/env python3
 """
 UHplift - LSM6DS3 IMU Bring-up Test
