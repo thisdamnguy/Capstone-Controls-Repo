@@ -31,7 +31,7 @@ GEAR_RATIO      = 4.0
 WHEEL_RADIUS_IN = 0.5                            # Placeholder — measure actual wheel
 
 # ── USER INPUT: change ONLY this for speed tests ──────────────────────────────
-TARGET_SPEED_HZ = 1000.0   # pulses/sec (step frequency)
+TARGET_SPEED_HZ = 2000.0   # pulses/sec (step frequency)
 
 # ── Auto-ramp "policy" knobs (usually leave these alone) ──────────────────────
 START_RATIO          = 0.10   # start speed = START_RATIO * target (typical 0.05–0.20)
@@ -291,7 +291,7 @@ def set_direction(pi, forward: bool):
 # ── Test run ──────────────────────────────────────────────────────────────────
 def run_test():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path  = os.path.join(os.path.expanduser("~"), f"crane_test_{timestamp}.csv")
+    log_path = os.path.join("/home/team11/encoder_data", f"crane_test_{timestamp}.csv")
 
     # Recompute at runtime (so if user edits TARGET, everything updates)
     start_hz, accel, decel = compute_ramp_params(TARGET_SPEED_HZ)
