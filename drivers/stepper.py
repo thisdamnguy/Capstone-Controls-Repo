@@ -1,405 +1,560 @@
 """
-Stepper Motor Driver Interface
-For CL42T-V41 closed-loop stepper drivers
+Stepper Motor Driver - pigpio DMA Waveforms
+Non-blocking continuous velocity interface for 200 Hz control loop
 
-The CL42T drivers accept:
-- PUL (pulse): Step signal
-- DIR: Direction signal
-- ENA: Enable signal (optional)
+Architecture:
+    set_velocity_continuous(v_in_s)   ← called every control tick (5ms)
+        Builds a repeating DMA waveform at the target pulse frequency.
+        Uses wave_send_repeat() for gapless output.  NEVER blocks.
 
-Control is via pulse frequency modulation.
+    _send_pulses_ramped_blocking()    ← retained for homing / --test-motors ONLY
+        Original trapezoidal profile with blocking wave_tx_busy() wait.
+
+Waveform swap protocol (avoids glitches):
+    1. wave_add_generic(new_pulses)
+    2. new_wid = wave_create()
+    3. wave_send_repeat(new_wid)     ← atomically replaces current TX
+    4. wave_delete(old_wid)          ← safe: old is no longer in DMA chain
+
+Hardware interface:
+    CL42T-V41 drivers via ULN2003AN level shifter
+    PUL/DIR/ENA control signals, 24V logic
+    
+Signal polarity (with ULN2003):
+    GPIO HIGH → ULN sinks → opto ON
+    ENA: GPIO LOW = disabled, GPIO HIGH = enabled
 """
 
+import pigpio
 import time
-import numpy as np
-from typing import Optional
+import math
+from typing import Optional, Tuple
 from dataclasses import dataclass
-from threading import Thread, Event
-from queue import Queue
 
-# Try to import RPi.GPIO, fall back to mock for development
-try:
-    import RPi.GPIO as GPIO
-    HAS_GPIO = True
-except ImportError:
-    HAS_GPIO = False
-    print("[STEPPER] RPi.GPIO not available, using simulation mode")
+
+# ── CL42T Timing Requirements ─────────────────────────────────────────────────
+# From CL42T V4.1 manual sequence chart
+T1_ENA_DIR_MS = 250     # ENA must precede DIR by ≥200ms
+T2_DIR_PUL_US = 10      # DIR must precede PUL rising edge by ≥2µs
+MIN_PULSE_WIDTH_US = 2  # Minimum HIGH or LOW time ≥1µs (use 2µs margin)
 
 
 @dataclass
 class StepperConfig:
-    """Stepper motor and driver configuration"""
-    # Pin assignments
-    pul_pin: int                # Pulse output pin (BCM numbering)
-    dir_pin: int                # Direction output pin
-    ena_pin: Optional[int]      # Enable pin (optional)
+    """Configuration for a single stepper axis."""
+    name: str
+    pul_pin: int          # BCM GPIO for pulse
+    dir_pin: int          # BCM GPIO for direction
+    ena_pin: int          # BCM GPIO for enable
     
-    # Motor parameters
-    steps_per_rev: int = 200    # Full steps per revolution
-    microstepping: int = 16     # Microstep divisor
+    steps_per_rev: int = 200      # Motor steps per revolution
+    microstepping: int = 4        # Microstep divisor (DIP switch setting)
+    gear_ratio: float = 4.0       # Motor:output shaft
+    wheel_radius_in: float = 0.5  # Drive wheel/drum radius [in]
     
-    # Drivetrain parameters
-    gear_ratio: float = 5.18    # Gearbox reduction
-    wheel_diameter: float = 1.5 # Drive wheel diameter [in]
+    # ── Continuous-mode parameters ────────────────────────────────────────
+    repeat_chunk_pulses: int = 20   # Pulses per repeating waveform
+    v_min_in_s: float = 0.01       # Below this |velocity|, stop TX [in/s]
     
-    # Limits
-    max_pulse_rate: float = 100000  # Max pulse frequency [Hz]
-    max_velocity: float = 10.0      # Max velocity [in/s]
+    # ── Blocking-ramp parameters (homing / test-motors only) ─────────────
+    start_ratio: float = 0.10
+    start_min_hz: float = 80.0
+    start_max_hz: float = 400.0
+    accel_scale: float = 3.0
+    accel_min_hz_s: float = 300.0
+    accel_max_hz_s: float = 12000.0
+    decel_scale: float = 3.0
+    decel_min_hz_s: float = 300.0
+    decel_max_hz_s: float = 12000.0
+    ramp_chunk_pulses: int = 200
     
     @property
-    def steps_per_rev_total(self) -> int:
-        """Total steps per motor revolution (with microstepping)"""
+    def pulses_per_rev(self) -> int:
+        """Pulses per motor shaft revolution."""
         return self.steps_per_rev * self.microstepping
     
     @property
-    def steps_per_inch(self) -> float:
-        """Steps per inch of linear travel"""
-        wheel_circumference = np.pi * self.wheel_diameter
-        motor_revs_per_inch = self.gear_ratio / wheel_circumference
-        return motor_revs_per_inch * self.steps_per_rev_total
+    def pulses_per_output_rev(self) -> int:
+        """Pulses per output shaft revolution (after gearbox)."""
+        return int(self.pulses_per_rev * self.gear_ratio)
     
     @property
-    def K_conv(self) -> float:
-        """
-        Velocity-to-pulse-frequency conversion factor [steps/s per in/s]
-        
-        From CDR Appendix K.6:
-            K_conv = steps_per_rev / (2π * r_wheel)
-            
-        But accounting for gear ratio and microstepping:
-            K_conv = (steps_per_rev * microstepping * gear_ratio) / (π * wheel_diameter)
-        
-        This equals steps_per_inch, so:
-            f_pulse [Hz] = v [in/s] * K_conv [steps/in]
-        """
-        return self.steps_per_inch
+    def inches_per_pulse(self) -> float:
+        """Linear travel per pulse [in/pulse]."""
+        circumference = 2 * math.pi * self.wheel_radius_in
+        return circumference / self.pulses_per_output_rev
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    """Clamp value to range [lo, hi]."""
+    return max(lo, min(hi, x))
 
 
 class StepperDriver:
     """
-    Stepper motor driver for crane axes.
+    Stepper motor driver using pigpio DMA waveforms.
     
-    Converts velocity/force commands to step pulses.
-    Tracks position by counting steps.
-    """
+    Primary API for closed-loop control:
+        set_velocity_continuous(velocity_in_s)   ← non-blocking, call every tick
     
-    def __init__(self, 
-                 config: StepperConfig,
-                 name: str = "stepper",
-                 simulation_mode: bool = None):
-        """
-        Initialize stepper driver.
-        
-        Args:
-            config: Stepper configuration
-            name: Axis name for logging
-            simulation_mode: Force simulation mode (auto-detect if None)
-        """
-        self.config = config
-        self.name = name
-        
-        # Auto-detect simulation mode
-        if simulation_mode is None:
-            self.simulation_mode = not HAS_GPIO
-        else:
-            self.simulation_mode = simulation_mode
-            
-        # State tracking
-        self._position_steps = 0
-        self._velocity = 0.0
-        self._direction = 1  # 1 = positive, -1 = negative
-        self._enabled = False
-        
-        # Pulse generation state
-        self._target_pulse_rate = 0.0
-        self._running = False
-        self._pulse_thread = None
-        self._stop_event = Event()
-        
-    def initialize(self) -> bool:
-        """
-        Initialize GPIO pins.
-        
-        Returns:
-            True if successful
-        """
-        if self.simulation_mode:
-            print(f"[{self.name}] Running in simulation mode")
-            self._enabled = True
-            return True
-            
-        try:
-            GPIO.setmode(GPIO.BCM)
-            
-            # Configure pins as outputs
-            GPIO.setup(self.config.pul_pin, GPIO.OUT, initial=GPIO.LOW)
-            GPIO.setup(self.config.dir_pin, GPIO.OUT, initial=GPIO.LOW)
-            
-            if self.config.ena_pin is not None:
-                GPIO.setup(self.config.ena_pin, GPIO.OUT, initial=GPIO.HIGH)
-                # Note: ENA is typically active-low
-                
-            print(f"[{self.name}] Initialized GPIO pins")
-            return True
-            
-        except Exception as e:
-            print(f"[{self.name}] Failed to initialize: {e}")
-            return False
-    
-    def enable(self):
-        """Enable the motor driver"""
-        self._enabled = True
-        if not self.simulation_mode and self.config.ena_pin is not None:
-            GPIO.output(self.config.ena_pin, GPIO.LOW)  # Active low
-        print(f"[{self.name}] Enabled")
-    
-    def disable(self):
-        """Disable the motor driver (motor can freewheel)"""
-        self.stop()
-        self._enabled = False
-        if not self.simulation_mode and self.config.ena_pin is not None:
-            GPIO.output(self.config.ena_pin, GPIO.HIGH)  # Active low
-        print(f"[{self.name}] Disabled")
-    
-    def set_velocity(self, velocity: float):
-        """
-        Set target velocity.
-        
-        Converts velocity to pulse frequency using K_conv from CDR K.6:
-            f_pulse = v_commanded * K_conv
-        
-        Args:
-            velocity: Target velocity [in/s], positive or negative
-        """
-        if not self._enabled:
-            return
-            
-        # Clamp to max velocity
-        velocity = np.clip(velocity, -self.config.max_velocity, self.config.max_velocity)
-        self._velocity = velocity
-        
-        # Set direction
-        if velocity >= 0:
-            self._direction = 1
-            if not self.simulation_mode:
-                GPIO.output(self.config.dir_pin, GPIO.HIGH)
-        else:
-            self._direction = -1
-            if not self.simulation_mode:
-                GPIO.output(self.config.dir_pin, GPIO.LOW)
-        
-        # Convert velocity to pulse rate using K_conv
-        # f_pulse [Hz] = v [in/s] * K_conv [steps/in]
-        self._target_pulse_rate = abs(velocity) * self.config.K_conv
-        
-    def set_force(self, force: float, axis_config, dt: float):
-        """
-        Set motor output based on force command.
-        
-        Implements the force-to-pulse conversion from CDR Appendix K.6:
-            a = F_saturated / m
-            Δv = a * Δt
-            v_commanded = v_actual + Δv
-            f_pulse = v_commanded * K_conv
-        
-        Args:
-            force: Commanded force [lbf] (F_saturated from controller)
-            axis_config: Axis configuration with mass
-            dt: Control timestep [s]
-        """
-        # Newton's 2nd law: a = F/m
-        # Using g_c for unit conversion (lbf to lbm*in/s²)
-        G_C = 386.09  # [lbm·in/(lbf·s²)]
-        accel = (force * G_C) / axis_config.m_t  # [in/s²]
-        
-        # Velocity increment: Δv = a * Δt
-        delta_v = accel * dt  # [in/s]
-        
-        # Update commanded velocity: v_commanded = v_actual + Δv
-        # v_actual comes from our tracked velocity (from step counting)
-        v_actual = self._velocity
-        v_commanded = v_actual + delta_v
-        
-        # Clamp to max velocity
-        v_commanded = np.clip(v_commanded, -self.config.max_velocity, self.config.max_velocity)
-        
-        # Set the new velocity (which converts to pulse frequency internally)
-        self.set_velocity(v_commanded)
-    
-    def stop(self):
-        """Stop motor immediately"""
-        self._velocity = 0.0
-        self._target_pulse_rate = 0.0
-        self._stop_event.set()
-        
-        if self._pulse_thread is not None:
-            self._pulse_thread.join(timeout=0.1)
-            self._pulse_thread = None
-    
-    def step_once(self, dt: float):
-        """
-        Generate steps for one control period.
-        
-        For real-time control, call this at the control rate.
-        
-        Args:
-            dt: Time period [s]
-        """
-        if not self._enabled or self._target_pulse_rate == 0:
-            return
-            
-        # Number of steps to generate
-        steps = int(self._target_pulse_rate * dt)
-        
-        if self.simulation_mode:
-            # Just update position counter
-            self._position_steps += steps * self._direction
-        else:
-            # Generate pulses
-            pulse_period = 1.0 / self._target_pulse_rate if self._target_pulse_rate > 0 else 0
-            half_period = pulse_period / 2
-            
-            for _ in range(steps):
-                GPIO.output(self.config.pul_pin, GPIO.HIGH)
-                time.sleep(half_period)
-                GPIO.output(self.config.pul_pin, GPIO.LOW)
-                time.sleep(half_period)
-                self._position_steps += self._direction
-    
-    def get_position(self) -> float:
-        """Get current position [in]"""
-        return self._position_steps / self.config.steps_per_inch
-    
-    def get_velocity(self) -> float:
-        """Get current commanded velocity [in/s]"""
-        return self._velocity
-    
-    def get_pulse_rate(self) -> float:
-        """Get current pulse rate [Hz]"""
-        return self._target_pulse_rate
-    
-    def get_position_steps(self) -> int:
-        """Get current position [steps]"""
-        return self._position_steps
-    
-    def debug_conversion_chain(self, force: float, mass: float, dt: float) -> dict:
-        """
-        Show the full force-to-pulse conversion chain for debugging.
-        
-        Implements CDR Appendix K.6 step-by-step.
-        
-        Args:
-            force: Input force [lbf]
-            mass: Moving mass [lbm]
-            dt: Timestep [s]
-            
-        Returns:
-            Dict with intermediate values
-        """
-        G_C = 386.09
-        
-        # Step 1: F = ma → a = F/m
-        accel = (force * G_C) / mass  # [in/s²]
-        
-        # Step 2: Δv = a * Δt
-        delta_v = accel * dt  # [in/s]
-        
-        # Step 3: v_commanded = v_actual + Δv
-        v_actual = self._velocity
-        v_commanded = v_actual + delta_v  # [in/s]
-        
-        # Step 4: f_pulse = v_commanded * K_conv
-        f_pulse = abs(v_commanded) * self.config.K_conv  # [Hz]
-        
-        return {
-            'F_saturated [lbf]': force,
-            'm [lbm]': mass,
-            'dt [s]': dt,
-            'a [in/s²]': accel,
-            'Δv [in/s]': delta_v,
-            'v_actual [in/s]': v_actual,
-            'v_commanded [in/s]': v_commanded,
-            'K_conv [steps/in]': self.config.K_conv,
-            'f_pulse [Hz]': f_pulse
-        }
-    
-    def reset_position(self, position: float = 0.0):
-        """Reset position counter"""
-        self._position_steps = int(position * self.config.steps_per_inch)
-    
-    def cleanup(self):
-        """Clean up GPIO resources"""
-        self.disable()
-        if not self.simulation_mode:
-            GPIO.cleanup([self.config.pul_pin, self.config.dir_pin])
-            if self.config.ena_pin is not None:
-                GPIO.cleanup([self.config.ena_pin])
-
-
-class DualAxisStepper:
-    """
-    Manages stepper drivers for trolley and bridge axes.
+    Blocking API for homing / motor checkout only:
+        _send_pulses_ramped_blocking(total_pulses, target_hz)
     """
     
     def __init__(self,
-                 trolley_config: StepperConfig,
-                 bridge_config: StepperConfig,
-                 simulation_mode: bool = None):
-        """
-        Initialize dual-axis stepper controller.
+                 config: StepperConfig,
+                 simulation_mode: bool = False):
+        self.config = config
+        self.simulation_mode = simulation_mode
         
-        Args:
-            trolley_config: Trolley axis stepper config
-            bridge_config: Bridge axis stepper config
-            simulation_mode: Force simulation mode
-        """
-        self.trolley = StepperDriver(trolley_config, "trolley", simulation_mode)
-        self.bridge = StepperDriver(bridge_config, "bridge", simulation_mode)
+        self._pi: Optional[pigpio.pi] = None
+        self._initialized = False
+        self._enabled = False
         
+        # ── Continuous-mode state ─────────────────────────────────────────
+        self._active_wid: int = -1          # Currently transmitting waveform ID
+        self._direction_forward: bool = True
+        self._last_half_period_us: int = 0  # Avoid redundant rebuilds
+        self._transmitting: bool = False
+        
+        # ── Position tracking ─────────────────────────────────────────────
+        self._commanded_pulses: int = 0
+    
+    # ══════════════════════════════════════════════════════════════════════════
+    # Lifecycle
+    # ══════════════════════════════════════════════════════════════════════════
+    
     def initialize(self) -> bool:
-        """Initialize both axes"""
-        return self.trolley.initialize() and self.bridge.initialize()
+        """Initialize pigpio and configure GPIO pins."""
+        if self.simulation_mode:
+            print(f"[STEPPER:{self.config.name}] Running in simulation mode")
+            self._initialized = True
+            return True
+        
+        self._pi = pigpio.pi()
+        if not self._pi.connected:
+            print(f"[STEPPER:{self.config.name}] ERROR: pigpio daemon not running")
+            print("  → Run: sudo pigpiod")
+            return False
+        
+        self._pi.set_mode(self.config.pul_pin, pigpio.OUTPUT)
+        self._pi.set_mode(self.config.dir_pin, pigpio.OUTPUT)
+        self._pi.set_mode(self.config.ena_pin, pigpio.OUTPUT)
+        
+        # Safe initial state (disabled)
+        self._pi.write(self.config.pul_pin, 0)
+        self._pi.write(self.config.dir_pin, 0)
+        self._pi.write(self.config.ena_pin, 0)
+        
+        print(f"[STEPPER:{self.config.name}] Initialized via pigpio")
+        print(f"  PUL=GPIO{self.config.pul_pin}, DIR=GPIO{self.config.dir_pin}, "
+              f"ENA=GPIO{self.config.ena_pin}")
+        
+        self._initialized = True
+        return True
     
     def enable(self):
-        """Enable both axes"""
-        self.trolley.enable()
-        self.bridge.enable()
+        """Enable motor driver.  Blocks for T1 ENA→DIR settle time."""
+        if self.simulation_mode or self._pi is None:
+            self._enabled = True
+            return
         
+        self._pi.write(self.config.ena_pin, 1)
+        print(f"[STEPPER:{self.config.name}] ENA asserted, waiting {T1_ENA_DIR_MS}ms...")
+        time.sleep(T1_ENA_DIR_MS / 1000.0)
+        self._enabled = True
+        print(f"[STEPPER:{self.config.name}] Driver ENABLED")
+    
     def disable(self):
-        """Disable both axes"""
-        self.trolley.disable()
-        self.bridge.disable()
+        """Disable motor driver and stop any active transmission."""
+        self._stop_transmission()
+        if self._pi is not None:
+            self._pi.write(self.config.ena_pin, 0)
+        self._enabled = False
+        print(f"[STEPPER:{self.config.name}] Driver DISABLED")
+    
+    def close(self):
+        """Release all resources."""
+        if self._pi is not None:
+            self._stop_transmission()
+            self.disable()
+            self._pi.write(self.config.pul_pin, 0)
+            self._pi.write(self.config.dir_pin, 0)
+            self._pi.stop()
+            self._pi = None
+        self._initialized = False
+    
+    # ══════════════════════════════════════════════════════════════════════════
+    # Non-blocking continuous velocity API  (called every control tick)
+    # ══════════════════════════════════════════════════════════════════════════
+    
+    def set_velocity_continuous(self, velocity_in_s: float) -> None:
+        """
+        Command a continuous linear velocity via repeating DMA waveform.
         
-    def stop(self):
-        """Stop both axes"""
-        self.trolley.stop()
-        self.bridge.stop()
+        Call this once per control tick (every 5ms at 200 Hz).
+        NEVER blocks.  The DMA engine streams pulses between ticks.
         
-    def cleanup(self):
-        """Clean up both axes"""
-        self.trolley.cleanup()
-        self.bridge.cleanup()
+        Args:
+            velocity_in_s: Signed trolley/bridge velocity [in/s].
+                           Positive = forward, negative = reverse.
+        """
+        # ── Simulation path ───────────────────────────────────────────────
+        if self.simulation_mode:
+            return
+        
+        if self._pi is None or not self._enabled:
+            return
+        
+        # ── Zero-velocity dead-band: stop transmission entirely ───────────
+        if abs(velocity_in_s) < self.config.v_min_in_s:
+            self._stop_transmission()
+            return
+        
+        # ── Determine desired direction and frequency ─────────────────────
+        desired_forward = (velocity_in_s > 0.0)
+        freq_hz = abs(velocity_in_s) / self.config.inches_per_pulse
+        half_period_us = self._hz_to_half_period_us(freq_hz)
+        
+        # ── Direction change: stop → flip DIR → settle → resume ───────────
+        if desired_forward != self._direction_forward:
+            self._stop_transmission()
+            self._direction_forward = desired_forward
+            self._pi.write(self.config.dir_pin, 1 if desired_forward else 0)
+            # CL42T requires ≥2µs DIR→PUL setup.  time.sleep resolves to
+            # ~50-100µs on Linux, well within the ≤100µs budget and well
+            # above the 2µs minimum.
+            time.sleep(T2_DIR_PUL_US / 1_000_000)
+        
+        # ── Skip rebuild if frequency unchanged ───────────────────────────
+        if half_period_us == self._last_half_period_us and self._transmitting:
+            return
+        
+        # ── Build new repeating waveform ──────────────────────────────────
+        new_wid = self._build_repeat_waveform(
+            self.config.repeat_chunk_pulses, half_period_us
+        )
+        if new_wid < 0:
+            return  # wave_create failed (resource exhaustion)
+        
+        # ── Atomic swap: start new, then delete old ───────────────────────
+        old_wid = self._active_wid
+        self._pi.wave_send_repeat(new_wid)
+        if old_wid >= 0:
+            try:
+                self._pi.wave_delete(old_wid)
+            except pigpio.error:
+                pass  # Already deleted or invalid — not critical
+        
+        self._active_wid = new_wid
+        self._last_half_period_us = half_period_us
+        self._transmitting = True
+    
+    def _stop_transmission(self) -> None:
+        """Stop DMA transmission and clean up the active waveform."""
+        if self._pi is None:
+            self._transmitting = False
+            return
+        
+        if self._transmitting:
+            self._pi.wave_tx_stop()
+            # Drive PUL low to leave output in a known state
+            self._pi.write(self.config.pul_pin, 0)
+        
+        if self._active_wid >= 0:
+            try:
+                self._pi.wave_delete(self._active_wid)
+            except pigpio.error:
+                pass
+            self._active_wid = -1
+        
+        self._last_half_period_us = 0
+        self._transmitting = False
+    
+    def _build_repeat_waveform(self, n_pulses: int, half_period_us: int) -> int:
+        """
+        Build a pigpio waveform suitable for wave_send_repeat().
+        
+        Does NOT call wave_clear() — that would destroy the currently
+        transmitting waveform.  wave_create() consumes and clears the
+        internal pulse buffer without affecting existing waveform IDs.
+        
+        Returns:
+            Waveform ID (≥0), or negative on failure.
+        """
+        pin_mask = 1 << self.config.pul_pin
+        pulse_list = []
+        for _ in range(n_pulses):
+            pulse_list.append(pigpio.pulse(pin_mask, 0, half_period_us))
+            pulse_list.append(pigpio.pulse(0, pin_mask, half_period_us))
+        
+        self._pi.wave_add_generic(pulse_list)
+        return self._pi.wave_create()
+    
+    # ══════════════════════════════════════════════════════════════════════════
+    # Blocking ramp API  (homing / --test-motors ONLY)
+    # ══════════════════════════════════════════════════════════════════════════
+    
+    def set_direction(self, forward: bool) -> None:
+        """Set motor direction with CL42T settle time (blocking)."""
+        self._direction_forward = forward
+        if self._pi is not None:
+            self._pi.write(self.config.dir_pin, 1 if forward else 0)
+            time.sleep(T2_DIR_PUL_US / 1_000_000)
+    
+    def _send_pulses_ramped_blocking(self,
+                                     total_pulses: int,
+                                     target_hz: float) -> None:
+        """
+        Send pulses with smooth trapezoidal/triangular velocity profile.
+        
+        *** BLOCKS until all pulses are sent. ***
+        Use ONLY in homing sequences or --test-motors mode.
+        NEVER call from the 200 Hz control loop.
+        
+        Args:
+            total_pulses: Number of pulses to send
+            target_hz: Target cruise frequency [Hz]
+        """
+        if self.simulation_mode:
+            if self._direction_forward:
+                self._commanded_pulses += total_pulses
+            else:
+                self._commanded_pulses -= total_pulses
+            return
+        
+        if self._pi is None or total_pulses <= 0:
+            return
+        
+        f_start, accel, decel = self._compute_ramp_params(target_hz)
+        chunk = self.config.ramp_chunk_pulses
+        
+        f0 = max(float(f_start), 1.0)
+        fT = max(float(target_hz), f0)
+        
+        # Calculate profile phases
+        pulses_accel = self._ramp_pulses_needed(f0, fT, accel)
+        pulses_decel = self._ramp_pulses_needed(f0, fT, decel)
+        
+        if pulses_accel + pulses_decel >= total_pulses:
+            f_peak = self._solve_peak_frequency(total_pulses, f0, accel, decel)
+            cruise_pulses = 0
+        else:
+            f_peak = fT
+            cruise_pulses = int(round(total_pulses - pulses_accel - pulses_decel))
+        
+        accel_pulses = int(round(self._ramp_pulses_needed(f0, f_peak, accel)))
+        decel_pulses = int(round(self._ramp_pulses_needed(f0, f_peak, decel)))
+        
+        used = accel_pulses + cruise_pulses + decel_pulses
+        if used != total_pulses:
+            cruise_pulses += (total_pulses - used)
+            cruise_pulses = max(cruise_pulses, 0)
+        
+        # Acceleration phase
+        f = f0
+        remaining = accel_pulses
+        while remaining > 0:
+            dp = min(chunk, remaining)
+            half_us = self._hz_to_half_period_us(f)
+            wid = self._build_blocking_waveform(dp, half_us)
+            self._send_waveform_blocking(wid)
+            f = math.sqrt(max(f * f + 2.0 * accel * float(dp), f0 * f0))
+            f = min(f, f_peak)
+            remaining -= dp
+        
+        # Cruise phase
+        remaining = cruise_pulses
+        if remaining > 0:
+            f = f_peak
+            while remaining > 0:
+                dp = min(chunk, remaining)
+                half_us = self._hz_to_half_period_us(f)
+                wid = self._build_blocking_waveform(dp, half_us)
+                self._send_waveform_blocking(wid)
+                remaining -= dp
+        
+        # Deceleration phase
+        remaining = decel_pulses
+        f = f_peak
+        while remaining > 0:
+            dp = min(chunk, remaining)
+            half_us = self._hz_to_half_period_us(f)
+            wid = self._build_blocking_waveform(dp, half_us)
+            self._send_waveform_blocking(wid)
+            f_sq_new = f * f - 2.0 * decel * float(dp)
+            f = math.sqrt(max(f_sq_new, f0 * f0))
+            remaining -= dp
+        
+        # Track commanded position
+        if self._direction_forward:
+            self._commanded_pulses += total_pulses
+        else:
+            self._commanded_pulses -= total_pulses
+    
+    def _send_pulses_constant_blocking(self, n_pulses: int,
+                                       frequency_hz: float) -> None:
+        """
+        Send pulses at constant frequency (no ramping).  BLOCKS.
+        For low-speed homing or testing only.
+        """
+        if self.simulation_mode:
+            if self._direction_forward:
+                self._commanded_pulses += n_pulses
+            else:
+                self._commanded_pulses -= n_pulses
+            return
+        
+        if self._pi is None or n_pulses <= 0:
+            return
+        
+        chunk = self.config.ramp_chunk_pulses
+        half_us = self._hz_to_half_period_us(frequency_hz)
+        
+        remaining = n_pulses
+        while remaining > 0:
+            dp = min(chunk, remaining)
+            wid = self._build_blocking_waveform(dp, half_us)
+            self._send_waveform_blocking(wid)
+            remaining -= dp
+        
+        if self._direction_forward:
+            self._commanded_pulses += n_pulses
+        else:
+            self._commanded_pulses -= n_pulses
+    
+    # ══════════════════════════════════════════════════════════════════════════
+    # Shared helpers
+    # ══════════════════════════════════════════════════════════════════════════
+    
+    def velocity_to_frequency(self, velocity_in_s: float) -> float:
+        """Convert velocity [in/s] to pulse frequency [Hz]."""
+        return abs(velocity_in_s) / self.config.inches_per_pulse
+    
+    def get_commanded_position(self) -> float:
+        """Get commanded position from pulse counting [in]."""
+        return self._commanded_pulses * self.config.inches_per_pulse
+    
+    def zero_position(self) -> None:
+        """Reset commanded position to zero."""
+        self._commanded_pulses = 0
+    
+    @property
+    def is_enabled(self) -> bool:
+        return self._enabled
+    
+    @property
+    def is_transmitting(self) -> bool:
+        return self._transmitting
+    
+    # ══════════════════════════════════════════════════════════════════════════
+    # Internal helpers
+    # ══════════════════════════════════════════════════════════════════════════
+    
+    def _hz_to_half_period_us(self, hz: float) -> int:
+        """Convert frequency to half-period in microseconds."""
+        hz = max(float(hz), 1.0)
+        half = int(1_000_000 / (2.0 * hz))
+        return max(half, MIN_PULSE_WIDTH_US)
+    
+    def _build_blocking_waveform(self, n_pulses: int, half_period_us: int) -> int:
+        """
+        Build waveform for blocking send (wave_send_once).
+        Calls wave_clear() first — safe because nothing else is transmitting
+        during a blocking ramp sequence.
+        """
+        if self._pi is None:
+            return -1
+        
+        self._pi.wave_clear()
+        pin_mask = 1 << self.config.pul_pin
+        pulse_list = []
+        for _ in range(n_pulses):
+            pulse_list.append(pigpio.pulse(pin_mask, 0, half_period_us))
+            pulse_list.append(pigpio.pulse(0, pin_mask, half_period_us))
+        self._pi.wave_add_generic(pulse_list)
+        return self._pi.wave_create()
+    
+    def _send_waveform_blocking(self, wid: int) -> None:
+        """Send waveform and block until complete."""
+        if self._pi is None or wid < 0:
+            return
+        self._pi.wave_send_once(wid)
+        while self._pi.wave_tx_busy():
+            time.sleep(0.005)
+        self._pi.wave_delete(wid)
+    
+    def _compute_ramp_params(self, target_hz: float) -> Tuple[float, float, float]:
+        """Compute (start_hz, accel, decel) for blocking ramp."""
+        t = max(float(target_hz), 1.0)
+        c = self.config
+        start_hz = clamp(t * c.start_ratio, c.start_min_hz, c.start_max_hz)
+        accel = clamp(t * c.accel_scale, c.accel_min_hz_s, c.accel_max_hz_s)
+        decel = clamp(t * c.decel_scale, c.decel_min_hz_s, c.decel_max_hz_s)
+        if t < start_hz:
+            start_hz = max(1.0, t * 0.5)
+        return start_hz, accel, decel
+    
+    @staticmethod
+    def _ramp_pulses_needed(f0: float, f1: float, slope: float) -> float:
+        slope = max(float(slope), 1e-6)
+        return (f1 * f1 - f0 * f0) / (2.0 * slope)
+    
+    @staticmethod
+    def _solve_peak_frequency(total_pulses: int, f_start: float,
+                              accel: float, decel: float) -> float:
+        a = max(float(accel), 1e-6)
+        d = max(float(decel), 1e-6)
+        f0_sq = f_start * f_start
+        denom = (1.0 / a) + (1.0 / d)
+        fpeak_sq = f0_sq + (2.0 * float(total_pulses)) / denom
+        return math.sqrt(max(fpeak_sq, f0_sq))
 
 
-# Default configurations (update pin numbers for your wiring)
-DEFAULT_TROLLEY_STEPPER = StepperConfig(
-    pul_pin=17,
+# ── Pre-configured Axes ───────────────────────────────────────────────────────
+# Pin assignments match config.py GPIO_PINS (validated)
+
+TROLLEY_STEPPER = StepperConfig(
+    name="trolley",
+    pul_pin=22,     # GPIO 22 — validated
     dir_pin=27,
-    ena_pin=22,
+    ena_pin=17,
     steps_per_rev=200,
-    microstepping=16,
-    gear_ratio=5.18,
-    wheel_diameter=1.5,
-    max_velocity=10.0
+    microstepping=4,
+    gear_ratio=5.0,
+    wheel_radius_in=0.75,
 )
 
-DEFAULT_BRIDGE_STEPPER = StepperConfig(
-    pul_pin=23,
+BRIDGE_STEPPER = StepperConfig(
+    name="bridge",
+    pul_pin=23,     # GPIO 23 — validated
     dir_pin=24,
     ena_pin=25,
     steps_per_rev=200,
-    microstepping=16,
-    gear_ratio=5.18,
-    wheel_diameter=1.5,
-    max_velocity=15.0
+    microstepping=4,
+    gear_ratio=4.0,
+    wheel_radius_in=1.0,   # wheel_diameter=2.0 in config.py → radius=1.0
 )
+
+HOIST_STEPPER = StepperConfig(
+    name="hoist",
+    pul_pin=5,
+    dir_pin=6,
+    ena_pin=13,
+    steps_per_rev=200,
+    microstepping=4,
+    gear_ratio=10.0,
+    wheel_radius_in=0.75,  # Drum radius [in]
+)
+
+
+def create_stepper(axis: str, simulation_mode: bool = False) -> StepperDriver:
+    """Factory function to create stepper driver for specified axis."""
+    configs = {
+        "trolley": TROLLEY_STEPPER,
+        "bridge": BRIDGE_STEPPER,
+        "hoist": HOIST_STEPPER,
+    }
+    if axis not in configs:
+        raise ValueError(f"Unknown axis: {axis}. Use 'trolley', 'bridge', or 'hoist'.")
+    return StepperDriver(configs[axis], simulation_mode)

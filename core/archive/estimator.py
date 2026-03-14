@@ -2,16 +2,12 @@
 State Estimation Module
 Processes raw sensor data into state estimates for control
 
-State vector: [v, θ, θ̇]
+State vector: [v, θ, θ̇, ∫e_v]
 
 Sensors:
-- Encoder (LS7366R): Provides position, from which velocity is derived
-- IMU (LSM6DS3): Provides θ (via accel) and θ̇ (via gyro)
-
-Key changes from original:
-- Position now comes from encoder SPI read (not stepper step counting)
-- IMU is LSM6DS3 over SPI (not MPU6050 over I2C)
-- Interface unchanged: SensorReadings → (v, θ, θ̇)
+- IMU (MPU6050): Provides θ (via accel) and θ̇ (via gyro)
+- Stepper position: Provides x, from which v is derived
+- Encoders (optional): Alternative velocity measurement
 """
 
 import numpy as np
@@ -24,14 +20,14 @@ from dataclasses import dataclass
 class SensorReadings:
     """Container for raw sensor data"""
     # IMU data
-    accel_x: float = 0.0    # [g]
-    accel_y: float = 0.0    # [g]
-    accel_z: float = 0.0    # [g]
+    accel_x: float = 0.0    # [g] - along cable
+    accel_y: float = 0.0    # [g] - perpendicular to cable  
+    accel_z: float = 0.0    # [g] - vertical
     gyro_x: float = 0.0     # [rad/s]
-    gyro_y: float = 0.0     # [rad/s]
+    gyro_y: float = 0.0     # [rad/s]  
     gyro_z: float = 0.0     # [rad/s]
     
-    # Position data (from encoder)
+    # Position data (from stepper or encoder)
     position: float = 0.0   # [in]
     
     # Timestamp
@@ -58,12 +54,12 @@ class LowPassFilter:
         
         self._y = 0.0
         self._initialized = False
-    
+        
     def reset(self, initial_value: float = 0.0):
         """Reset filter state"""
         self._y = initial_value
         self._initialized = True
-    
+        
     def update(self, x: float) -> float:
         """
         Apply filter to new sample.
@@ -89,9 +85,9 @@ class LowPassFilter:
 
 class DerivativeEstimator:
     """
-    Estimates derivative from position measurements.
+    Estimates derivative from position/angle measurements.
     
-    Uses finite difference with optional filtering.
+    Uses simple finite difference with optional filtering.
     """
     
     def __init__(self, dt: float, filter_cutoff_hz: Optional[float] = None):
@@ -111,7 +107,7 @@ class DerivativeEstimator:
             self._filter = LowPassFilter(filter_cutoff_hz, dt)
         else:
             self._filter = None
-    
+            
     def reset(self):
         """Reset estimator state"""
         self._last_value = 0.0
@@ -119,7 +115,7 @@ class DerivativeEstimator:
         self._initialized = False
         if self._filter is not None:
             self._filter.reset()
-    
+            
     def update(self, value: float) -> float:
         """
         Compute derivative from new sample.
@@ -134,7 +130,7 @@ class DerivativeEstimator:
             self._last_value = value
             self._initialized = True
             return 0.0
-        
+            
         # Finite difference
         derivative = (value - self._last_value) / self.dt
         self._last_value = value
@@ -142,7 +138,7 @@ class DerivativeEstimator:
         # Optional filtering
         if self._filter is not None:
             derivative = self._filter.update(derivative)
-        
+            
         self._last_derivative = derivative
         return derivative
 
@@ -166,11 +162,11 @@ class ComplementaryFilter:
         self.alpha = alpha
         self.dt = dt
         self._theta = 0.0
-    
+        
     def reset(self, theta: float = 0.0):
         """Reset to initial angle"""
         self._theta = theta
-    
+        
     def update(self, gyro_rate: float, accel_angle: float) -> float:
         """
         Fuse gyro and accelerometer measurements.
@@ -204,9 +200,9 @@ class StateEstimator:
     (Integrator state is maintained by controller, not estimator)
     """
     
-    def __init__(self,
+    def __init__(self, 
                  dt: float,
-                 imu_cutoff_hz: float = 10.0,
+                 imu_cutoff_hz: float = 15.0,
                  velocity_cutoff_hz: float = 20.0,
                  use_complementary: bool = True,
                  complementary_alpha: float = 0.98):
@@ -226,7 +222,7 @@ class StateEstimator:
         self.theta_filter = LowPassFilter(imu_cutoff_hz, dt)
         self.theta_dot_filter = LowPassFilter(imu_cutoff_hz, dt)
         
-        # Velocity estimation (from encoder position)
+        # Velocity estimation
         self.velocity_estimator = DerivativeEstimator(dt, velocity_cutoff_hz)
         
         # Complementary filter for angle fusion
@@ -239,7 +235,7 @@ class StateEstimator:
         self._velocity = 0.0
         self._theta = 0.0
         self._theta_dot = 0.0
-    
+        
     def reset(self):
         """Reset all estimator state"""
         self.theta_filter.reset()
@@ -251,7 +247,7 @@ class StateEstimator:
         self._velocity = 0.0
         self._theta = 0.0
         self._theta_dot = 0.0
-    
+        
     def update(self, readings: SensorReadings) -> Tuple[float, float, float]:
         """
         Process sensor readings and estimate state.
@@ -262,15 +258,17 @@ class StateEstimator:
         Returns:
             Tuple of (velocity [in/s], theta [rad], theta_dot [rad/s])
         """
-        # --- Position and Velocity (from encoder) ---
+        # --- Position and Velocity ---
         self._position = readings.position
         self._velocity = self.velocity_estimator.update(readings.position)
         
-        # --- Sway Angle (θ) from IMU ---
-        # θ ≈ atan2(accel_y, accel_z) for small angles
+        # --- Sway Angle (θ) ---
+        # From accelerometer: θ ≈ atan2(accel_y, accel_z) for small angles
+        # Assuming IMU mounted on load, accel_y is lateral, accel_z is vertical
         theta_accel = np.arctan2(readings.accel_y, readings.accel_z)
         
-        # Angular rate from gyro
+        # From gyro: integrate angular rate
+        # Assuming gyro_x measures sway rotation (depends on mounting)
         theta_dot_raw = readings.gyro_x
         
         if self.use_complementary:
@@ -314,26 +312,35 @@ class SimulatedSensors:
     """
     Simulated sensor readings for testing without hardware.
     
-    Takes true state and adds realistic noise.
+    Takes true state and adds realistic noise and delay.
     """
     
     def __init__(self,
-                 position_noise_std: float = 0.001,
-                 accel_noise_std: float = 0.01,
-                 gyro_noise_std: float = 0.01):
+                 position_noise_std: float = 0.001,   # [in]
+                 theta_noise_std: float = 0.001,       # [rad]
+                 theta_dot_noise_std: float = 0.01,    # [rad/s]
+                 accel_noise_std: float = 0.01,        # [g]
+                 delay_samples: int = 1):
         """
         Initialize simulated sensors.
         
         Args:
-            position_noise_std: Position measurement noise std [in]
-            accel_noise_std: Accelerometer noise std [g]
-            gyro_noise_std: Gyroscope noise std [rad/s]
+            position_noise_std: Position measurement noise std
+            theta_noise_std: Angle measurement noise std  
+            theta_dot_noise_std: Angular rate noise std
+            accel_noise_std: Accelerometer noise std
+            delay_samples: Measurement delay in samples
         """
         self.position_noise_std = position_noise_std
+        self.theta_noise_std = theta_noise_std
+        self.theta_dot_noise_std = theta_dot_noise_std
         self.accel_noise_std = accel_noise_std
-        self.gyro_noise_std = gyro_noise_std
-    
-    def generate_reading(self,
+        self.delay_samples = delay_samples
+        
+        # Delay buffer
+        self._buffer = deque(maxlen=max(1, delay_samples))
+        
+    def generate_reading(self, 
                          true_position: float,
                          true_theta: float,
                          true_theta_dot: float,
@@ -350,22 +357,31 @@ class SimulatedSensors:
         Returns:
             Simulated sensor readings with noise
         """
+        # Add noise to measurements
         position = true_position + np.random.normal(0, self.position_noise_std)
         
-        # Accelerometer measures gravity vector direction
+        # Simulate accelerometer reading (measures gravity + acceleration)
+        # For sway angle estimation: accel_y ≈ sin(θ), accel_z ≈ cos(θ)
         accel_y = np.sin(true_theta) + np.random.normal(0, self.accel_noise_std)
         accel_z = np.cos(true_theta) + np.random.normal(0, self.accel_noise_std)
         
-        # Gyro measures angular rate
-        gyro_x = true_theta_dot + np.random.normal(0, self.gyro_noise_std)
+        # Gyro directly measures angular rate
+        gyro_x = true_theta_dot + np.random.normal(0, self.theta_dot_noise_std)
         
-        return SensorReadings(
+        reading = SensorReadings(
             accel_x=np.random.normal(0, self.accel_noise_std),
             accel_y=accel_y,
             accel_z=accel_z,
             gyro_x=gyro_x,
-            gyro_y=np.random.normal(0, self.gyro_noise_std),
-            gyro_z=np.random.normal(0, self.gyro_noise_std),
+            gyro_y=np.random.normal(0, self.theta_dot_noise_std),
+            gyro_z=np.random.normal(0, self.theta_dot_noise_std),
             position=position,
             timestamp=timestamp
         )
+        
+        # Apply delay
+        self._buffer.append(reading)
+        if len(self._buffer) >= self.delay_samples:
+            return self._buffer[0]
+        else:
+            return reading

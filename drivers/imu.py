@@ -1,70 +1,114 @@
 """
-IMU Driver - MPU6050 Interface
-Placeholder implementation for Raspberry Pi
+LSM6DS3 IMU Driver - SPI Interface
+Replaces original MPU6050 I2C driver
 
-The actual implementation will use smbus2 for I2C communication.
-This file provides the interface and can be run in simulation mode.
+Hardware: NOYITO LSM6DS3 breakout board
+Interface: SPI0, CE1 (GPIO 7), Mode 3
+
+Based on Control Philosophy document section 3.3 and lsm6ds3_spi_bringup.py
+
+Key differences from MPU6050:
+    - SPI instead of I2C
+    - Mode 3 (CPOL=1, CPHA=1)
+    - WHO_AM_I = 0x69 (not 0x68)
+    - Different register addresses and sensitivity values
+    
+Output contract (unchanged from original):
+    read_angle_and_rate() → (theta [rad], theta_dot [rad/s])
+    
+This allows estimator.py to work without modification.
 """
 
+import spidev
 import time
 import numpy as np
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-# MPU6050 Register addresses
-MPU6050_ADDR = 0x68
-PWR_MGMT_1 = 0x6B
-SMPLRT_DIV = 0x19
-CONFIG = 0x1A
-GYRO_CONFIG = 0x1B
-ACCEL_CONFIG = 0x1C
-ACCEL_XOUT_H = 0x3B
-GYRO_XOUT_H = 0x43
+
+# ── LSM6DS3 Register Addresses ────────────────────────────────────────────────
+REG_WHO_AM_I    = 0x0F
+REG_CTRL1_XL    = 0x10   # Accelerometer control
+REG_CTRL2_G     = 0x11   # Gyroscope control
+REG_CTRL3_C     = 0x12   # Control register 3
+REG_CTRL4_C     = 0x13   # Control register 4
+REG_FIFO_CTRL5  = 0x0A   # FIFO control
+REG_OUTX_L_G    = 0x22   # Gyro X low byte (start of 12-byte burst read)
+
+# Expected WHO_AM_I response
+WHO_AM_I_EXPECTED = 0x69
+
+# SPI read/write flags
+SPI_READ  = 0x80   # Set bit 7 for read
+SPI_WRITE = 0x00   # Clear bit 7 for write
 
 
 @dataclass
-class IMUConfig:
+class LSM6DS3Config:
     """IMU configuration parameters"""
-    accel_range: int = 2        # ±2g, ±4g, ±8g, or ±16g
-    gyro_range: int = 250       # ±250, ±500, ±1000, or ±2000 deg/s
-    dlpf_bandwidth: int = 3     # Digital low-pass filter setting (0-6)
-    sample_rate_div: int = 9    # Sample rate = 1kHz / (1 + div) = 100Hz
+    # Accelerometer settings
+    accel_odr: int = 5        # Output data rate: 5 = 208 Hz
+    accel_fs: int = 2         # Full scale: 2 = ±4g
+    
+    # Gyroscope settings
+    gyro_odr: int = 5         # Output data rate: 5 = 208 Hz
+    gyro_fs: int = 1          # Full scale: 1 = ±500 dps
+    
+    @property
+    def ctrl1_xl_value(self) -> int:
+        """Compute CTRL1_XL register value"""
+        # [ODR_XL(4)][FS_XL(2)][BW_XL(2)]
+        return (self.accel_odr << 4) | (self.accel_fs << 2) | 0x00
+    
+    @property
+    def ctrl2_g_value(self) -> int:
+        """Compute CTRL2_G register value"""
+        # [ODR_G(4)][FS_G(2)][FS_125(1)][0]
+        return (self.gyro_odr << 4) | (self.gyro_fs << 2) | 0x00
+    
+    @property
+    def accel_sensitivity(self) -> float:
+        """Accelerometer sensitivity [g/LSB]"""
+        # From datasheet table
+        sens_map = {0: 0.000061, 1: 0.000122, 2: 0.000122, 3: 0.000488}
+        return sens_map.get(self.accel_fs, 0.000122)  # Default ±4g
+    
+    @property
+    def gyro_sensitivity(self) -> float:
+        """Gyroscope sensitivity [dps/LSB]"""
+        # From datasheet table
+        sens_map = {0: 0.00875, 1: 0.0175, 2: 0.035, 3: 0.070}
+        return sens_map.get(self.gyro_fs, 0.0175)  # Default ±500 dps
 
 
-class MPU6050:
+class LSM6DS3:
     """
-    MPU6050 IMU driver.
+    LSM6DS3 6-axis IMU driver via SPI.
     
-    On Raspberry Pi, uses smbus2 for I2C.
-    In simulation mode, generates fake data.
+    Provides acceleration and angular rate measurements for sway estimation.
     """
     
-    # Scale factors based on range setting
-    ACCEL_SCALES = {2: 16384.0, 4: 8192.0, 8: 4096.0, 16: 2048.0}
-    GYRO_SCALES = {250: 131.0, 500: 65.5, 1000: 32.8, 2000: 16.4}
-    
-    def __init__(self, 
-                 config: Optional[IMUConfig] = None,
-                 simulation_mode: bool = True,
-                 i2c_bus: int = 1):
+    def __init__(self,
+                 config: Optional[LSM6DS3Config] = None,
+                 simulation_mode: bool = False,
+                 spi_bus: int = 0,
+                 spi_ce: int = 1):    # CE1 = GPIO7
         """
-        Initialize IMU.
+        Initialize IMU driver.
         
         Args:
             config: IMU configuration
-            simulation_mode: If True, generate fake data instead of reading hardware
-            i2c_bus: I2C bus number (typically 1 on Pi)
+            simulation_mode: If True, generate fake data
+            spi_bus: SPI bus number (0)
+            spi_ce: Chip enable (1 for CE1/GPIO7)
         """
-        self.config = config or IMUConfig()
+        self.config = config or LSM6DS3Config()
         self.simulation_mode = simulation_mode
-        self.i2c_bus = i2c_bus
+        self.spi_bus = spi_bus
+        self.spi_ce = spi_ce
         
-        # Scale factors
-        self.accel_scale = self.ACCEL_SCALES[self.config.accel_range]
-        self.gyro_scale = self.GYRO_SCALES[self.config.gyro_range]
-        
-        # I2C bus (set when initialized)
-        self._bus = None
+        self._spi: Optional[spidev.SpiDev] = None
+        self._initialized = False
         
         # Calibration offsets
         self.accel_offset = np.zeros(3)
@@ -73,114 +117,136 @@ class MPU6050:
         # Simulation state
         self._sim_theta = 0.0
         self._sim_theta_dot = 0.0
-        
+    
     def initialize(self) -> bool:
         """
-        Initialize the IMU hardware.
+        Initialize SPI and configure LSM6DS3.
         
         Returns:
-            True if successful
+            True if WHO_AM_I = 0x69 confirmed
         """
         if self.simulation_mode:
             print("[IMU] Running in simulation mode")
+            self._initialized = True
             return True
-            
+        
         try:
-            import smbus2
-            self._bus = smbus2.SMBus(self.i2c_bus)
+            self._spi = spidev.SpiDev()
+            self._spi.open(self.spi_bus, self.spi_ce)
+            self._spi.max_speed_hz = 1_000_000  # 1 MHz
+            self._spi.mode = 0b11  # Mode 3: CPOL=1, CPHA=1
             
-            # Wake up MPU6050 (clear sleep bit)
-            self._bus.write_byte_data(MPU6050_ADDR, PWR_MGMT_1, 0x00)
-            time.sleep(0.1)
+            # Step 1: Verify WHO_AM_I
+            who_am_i = self._read_register(REG_WHO_AM_I)
+            if who_am_i != WHO_AM_I_EXPECTED:
+                print(f"[IMU] WHO_AM_I mismatch: got 0x{who_am_i:02X}, "
+                      f"expected 0x{WHO_AM_I_EXPECTED:02X}")
+                if who_am_i in (0x00, 0xFF):
+                    print("  → Check wiring: headers may not be soldered")
+                    print("  → Verify SPI CE1 (GPIO7) connection")
+                return False
             
-            # Set sample rate divider
-            self._bus.write_byte_data(MPU6050_ADDR, SMPLRT_DIV, self.config.sample_rate_div)
+            print(f"[IMU] WHO_AM_I = 0x{who_am_i:02X} ✓")
             
-            # Set DLPF (digital low-pass filter)
-            self._bus.write_byte_data(MPU6050_ADDR, CONFIG, self.config.dlpf_bandwidth)
+            # Step 2: Configure accelerometer
+            self._write_register(REG_CTRL1_XL, self.config.ctrl1_xl_value)
+            time.sleep(0.001)
             
-            # Set accelerometer range
-            accel_config_val = {2: 0, 4: 1, 8: 2, 16: 3}[self.config.accel_range] << 3
-            self._bus.write_byte_data(MPU6050_ADDR, ACCEL_CONFIG, accel_config_val)
+            # Step 3: Configure gyroscope
+            self._write_register(REG_CTRL2_G, self.config.ctrl2_g_value)
+            time.sleep(0.001)
             
-            # Set gyroscope range
-            gyro_config_val = {250: 0, 500: 1, 1000: 2, 2000: 3}[self.config.gyro_range] << 3
-            self._bus.write_byte_data(MPU6050_ADDR, GYRO_CONFIG, gyro_config_val)
+            # Step 4: Configure control registers
+            # CTRL3_C: BDU=1, IF_INC=1, SIM=0 (4-wire SPI)
+            ctrl3_c = 0x44  # BDU + IF_INC
+            self._write_register(REG_CTRL3_C, ctrl3_c)
+            time.sleep(0.001)
             
-            print(f"[IMU] Initialized MPU6050 on I2C bus {self.i2c_bus}")
+            # CTRL4_C: Disable I2C interface
+            ctrl4_c = 0x04  # I2C_disable
+            self._write_register(REG_CTRL4_C, ctrl4_c)
+            time.sleep(0.001)
+            
+            # Step 5: Verify configuration
+            readback_xl = self._read_register(REG_CTRL1_XL)
+            readback_g = self._read_register(REG_CTRL2_G)
+            
+            print(f"[IMU] CTRL1_XL = 0x{readback_xl:02X}, CTRL2_G = 0x{readback_g:02X}")
+            
+            self._initialized = True
             return True
             
         except Exception as e:
             print(f"[IMU] Failed to initialize: {e}")
             return False
     
-    def calibrate(self, num_samples: int = 100, delay_ms: int = 10) -> bool:
-        """
-        Calibrate by measuring offsets at rest.
-        
-        IMU should be stationary during calibration!
-        
-        Args:
-            num_samples: Number of samples to average
-            delay_ms: Delay between samples [ms]
-            
-        Returns:
-            True if successful
-        """
-        print(f"[IMU] Calibrating with {num_samples} samples...")
-        
-        accel_sum = np.zeros(3)
-        gyro_sum = np.zeros(3)
-        
-        for _ in range(num_samples):
-            ax, ay, az, gx, gy, gz = self._read_raw()
-            accel_sum += np.array([ax, ay, az])
-            gyro_sum += np.array([gx, gy, gz])
-            time.sleep(delay_ms / 1000.0)
-        
-        # Compute averages
-        accel_avg = accel_sum / num_samples
-        gyro_avg = gyro_sum / num_samples
-        
-        # Gyro offset: should be zero at rest
-        self.gyro_offset = gyro_avg
-        
-        # Accel offset: should be [0, 0, 1g] at rest (assuming Z is vertical)
-        # We'll just store the raw average and let the estimator handle orientation
-        self.accel_offset = accel_avg - np.array([0, 0, 1.0])
-        
-        print(f"[IMU] Calibration complete")
-        print(f"  Accel offset: {self.accel_offset}")
-        print(f"  Gyro offset: {self.gyro_offset}")
-        
-        return True
+    def _read_register(self, reg: int) -> int:
+        """Read single register."""
+        if self._spi is None:
+            return 0
+        resp = self._spi.xfer2([reg | SPI_READ, 0x00])
+        return resp[1]
     
-    def _read_raw(self) -> Tuple[float, float, float, float, float, float]:
-        """Read raw (uncalibrated) sensor values"""
+    def _write_register(self, reg: int, value: int):
+        """Write single register."""
+        if self._spi is None:
+            return
+        self._spi.xfer2([reg | SPI_WRITE, value])
+    
+    def _read_burst(self, start_reg: int, num_bytes: int) -> list:
+        """
+        Burst read multiple consecutive registers.
+        
+        IF_INC must be enabled for this to work.
+        """
+        if self._spi is None:
+            return [0] * num_bytes
+        
+        # First byte: register address with read flag
+        tx = [start_reg | SPI_READ] + [0x00] * num_bytes
+        rx = self._spi.xfer2(tx)
+        return rx[1:]  # Skip first byte (garbage during address phase)
+    
+    def read_raw(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Read raw sensor values (uncalibrated).
+        
+        Returns:
+            Tuple of (accel [g], gyro [rad/s]) as 3-element arrays
+        """
         if self.simulation_mode:
             return self._generate_sim_data()
-            
-        # Read accelerometer (6 bytes starting at ACCEL_XOUT_H)
-        accel_data = self._bus.read_i2c_block_data(MPU6050_ADDR, ACCEL_XOUT_H, 6)
-        ax = self._bytes_to_int(accel_data[0], accel_data[1]) / self.accel_scale
-        ay = self._bytes_to_int(accel_data[2], accel_data[3]) / self.accel_scale
-        az = self._bytes_to_int(accel_data[4], accel_data[5]) / self.accel_scale
         
-        # Read gyroscope (6 bytes starting at GYRO_XOUT_H)
-        gyro_data = self._bus.read_i2c_block_data(MPU6050_ADDR, GYRO_XOUT_H, 6)
-        gx = self._bytes_to_int(gyro_data[0], gyro_data[1]) / self.gyro_scale
-        gy = self._bytes_to_int(gyro_data[2], gyro_data[3]) / self.gyro_scale
-        gz = self._bytes_to_int(gyro_data[4], gyro_data[5]) / self.gyro_scale
+        if not self._initialized:
+            return np.zeros(3), np.zeros(3)
         
-        # Convert gyro to rad/s
-        gx = np.radians(gx)
-        gy = np.radians(gy)
-        gz = np.radians(gz)
+        # Burst read 12 bytes starting at OUTX_L_G
+        # Order: Gx_L, Gx_H, Gy_L, Gy_H, Gz_L, Gz_H,
+        #        Ax_L, Ax_H, Ay_L, Ay_H, Az_L, Az_H
+        data = self._read_burst(REG_OUTX_L_G, 12)
         
-        return ax, ay, az, gx, gy, gz
+        # Parse gyroscope (first 6 bytes)
+        gx_raw = self._bytes_to_int16(data[0], data[1])
+        gy_raw = self._bytes_to_int16(data[2], data[3])
+        gz_raw = self._bytes_to_int16(data[4], data[5])
+        
+        # Parse accelerometer (last 6 bytes)
+        ax_raw = self._bytes_to_int16(data[6], data[7])
+        ay_raw = self._bytes_to_int16(data[8], data[9])
+        az_raw = self._bytes_to_int16(data[10], data[11])
+        
+        # Convert to physical units
+        accel_sens = self.config.accel_sensitivity
+        gyro_sens = self.config.gyro_sensitivity
+        
+        accel = np.array([ax_raw, ay_raw, az_raw]) * accel_sens  # [g]
+        gyro_dps = np.array([gx_raw, gy_raw, gz_raw]) * gyro_sens  # [dps]
+        gyro = np.radians(gyro_dps)  # [rad/s]
+        
+        return accel, gyro
     
-    def _bytes_to_int(self, high: int, low: int) -> int:
-        """Convert two bytes to signed 16-bit integer"""
+    def _bytes_to_int16(self, low: int, high: int) -> int:
+        """Convert two bytes to signed 16-bit integer (little-endian)."""
         value = (high << 8) | low
         if value >= 0x8000:
             value -= 0x10000
@@ -193,10 +259,10 @@ class MPU6050:
         Returns:
             Tuple of (accel [g], gyro [rad/s]) as 3-element arrays
         """
-        ax, ay, az, gx, gy, gz = self._read_raw()
+        accel_raw, gyro_raw = self.read_raw()
         
-        accel = np.array([ax, ay, az]) - self.accel_offset
-        gyro = np.array([gx, gy, gz]) - self.gyro_offset
+        accel = accel_raw - self.accel_offset
+        gyro = gyro_raw - self.gyro_offset
         
         return accel, gyro
     
@@ -204,24 +270,74 @@ class MPU6050:
         """
         Read sway angle (from accel) and rate (from gyro).
         
-        Convenience method for crane control.
+        This is the primary interface for crane control.
+        Output contract matches original MPU6050 driver.
         
         Returns:
             Tuple of (theta [rad], theta_dot [rad/s])
         """
         accel, gyro = self.read()
         
-        # Angle from accelerometer (assuming Y is lateral sway, Z is vertical)
+        # Sway angle from accelerometer
+        # θ_x ≈ atan2(a_y, a_z) - angle about X-axis (trolley sway)
+        # θ_y ≈ atan2(a_x, a_z) - angle about Y-axis (bridge sway)
+        # Using Y/Z for primary sway direction (adjust based on IMU mounting)
         theta = np.arctan2(accel[1], accel[2])
         
-        # Rate from gyroscope (assuming X-axis rotation is sway)
+        # Sway rate from gyroscope
+        # Using X-axis gyro for sway rate (adjust based on mounting)
         theta_dot = gyro[0]
         
         return theta, theta_dot
     
-    def _generate_sim_data(self) -> Tuple[float, float, float, float, float, float]:
-        """Generate simulated sensor data"""
-        # Add some noise
+    def calibrate(self, num_samples: int = 100, delay_ms: int = 10) -> bool:
+        """
+        Calibrate by measuring offsets at rest.
+        
+        IMU must be stationary and level during calibration!
+        
+        Args:
+            num_samples: Number of samples to average
+            delay_ms: Delay between samples [ms]
+            
+        Returns:
+            True if successful
+        """
+        print(f"[IMU] Calibrating with {num_samples} samples...")
+        print("  → Keep IMU stationary!")
+        
+        accel_sum = np.zeros(3)
+        gyro_sum = np.zeros(3)
+        
+        for i in range(num_samples):
+            accel, gyro = self.read_raw()
+            accel_sum += accel
+            gyro_sum += gyro
+            time.sleep(delay_ms / 1000.0)
+            
+            if (i + 1) % 25 == 0:
+                print(f"  → {i + 1}/{num_samples}")
+        
+        # Compute averages
+        accel_avg = accel_sum / num_samples
+        gyro_avg = gyro_sum / num_samples
+        
+        # Gyro offset: should be zero at rest
+        self.gyro_offset = gyro_avg
+        
+        # Accel offset: should be [0, 0, 1g] at rest (Z vertical)
+        self.accel_offset = accel_avg - np.array([0.0, 0.0, 1.0])
+        
+        print(f"[IMU] Calibration complete")
+        print(f"  Accel offset: [{self.accel_offset[0]:.4f}, "
+              f"{self.accel_offset[1]:.4f}, {self.accel_offset[2]:.4f}] g")
+        print(f"  Gyro offset:  [{self.gyro_offset[0]:.4f}, "
+              f"{self.gyro_offset[1]:.4f}, {self.gyro_offset[2]:.4f}] rad/s")
+        
+        return True
+    
+    def _generate_sim_data(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Generate simulated sensor data."""
         noise_a = 0.01  # [g]
         noise_g = 0.02  # [rad/s]
         
@@ -235,15 +351,20 @@ class MPU6050:
         gy = np.random.normal(0, noise_g)
         gz = np.random.normal(0, noise_g)
         
-        return ax, ay, az, gx, gy, gz
+        return np.array([ax, ay, az]), np.array([gx, gy, gz])
     
     def set_sim_state(self, theta: float, theta_dot: float):
-        """Set simulation state (for testing)"""
+        """Set simulation state (for testing)."""
         self._sim_theta = theta
         self._sim_theta_dot = theta_dot
     
     def close(self):
-        """Close I2C connection"""
-        if self._bus is not None:
-            self._bus.close()
-            self._bus = None
+        """Close SPI connection."""
+        if self._spi is not None:
+            self._spi.close()
+            self._spi = None
+            self._initialized = False
+
+
+# For backwards compatibility with original interface name
+IMU = LSM6DS3

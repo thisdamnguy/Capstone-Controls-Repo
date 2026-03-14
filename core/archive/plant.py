@@ -1,10 +1,10 @@
 """
 Crane Plant Model - State Space Representation
-Matches the derivation in LQR_Control.m and CDR Appendix C
+Matches the derivation in LQR_Control.m and Appendix C of the CDR
 
 State vector (full): x = [x, v, θ, θ̇]ᵀ
   x     - position [in]
-  v     - velocity [in/s]
+  v     - velocity [in/s]  
   θ     - sway angle [rad]
   θ̇     - sway angular rate [rad/s]
 
@@ -12,17 +12,11 @@ State vector (reduced, for control): x_red = [v, θ, θ̇]ᵀ
 State vector (augmented with integrator): x_aug = [v, θ, θ̇, ∫e_v]ᵀ
 
 Input: u = F (force) [lbf]
-
-This module is used for:
-- Offline simulation
-- Gain verification
-- System identification validation
 """
 
 import numpy as np
 from dataclasses import dataclass
 from typing import Tuple
-
 from .config import G_IN_PER_S2, G_C, AxisConfig, SystemConfig
 
 
@@ -37,8 +31,8 @@ class PlantMatrices:
     B_aug: np.ndarray       # 4x1 augmented input matrix
 
 
-def build_plant_matrices(axis_config: AxisConfig,
-                         m_l: float,
+def build_plant_matrices(axis_config: AxisConfig, 
+                         m_l: float, 
                          L: float,
                          c_theta: float = 0.05) -> PlantMatrices:
     """
@@ -87,12 +81,15 @@ def build_plant_matrices(axis_config: AxisConfig,
     
     # Augmented system (add integrator for velocity error)
     # x_aug = [v, θ, θ̇, ∫(v_ref - v)dt]
+    # The integrator row: d(∫e)/dt = v_ref - v = -v (when computing state derivative)
     A_aug = np.zeros((4, 4))
     A_aug[0:3, 0:3] = A_red
     A_aug[3, 0] = -1.0  # Integrator accumulates negative of velocity
+    # A_aug[3, 1:4] = 0 (integrator not affected by θ, θ̇, or itself)
     
     B_aug = np.zeros((4, 1))
     B_aug[0:3, 0] = B_red.flatten()
+    # B_aug[3] = 0 (force doesn't directly affect integrator)
     
     return PlantMatrices(
         A_full=A_full,
@@ -106,11 +103,11 @@ def build_plant_matrices(axis_config: AxisConfig,
 
 class CranePlant:
     """
-    Crane plant model for simulation.
+    Crane plant model for simulation and state propagation.
     
-    Used for:
-    - Offline simulation and gain verification
-    - System dynamics integration
+    Can be used in two modes:
+    1. Simulation: Full dynamics integration
+    2. Real-time: Just provides matrices for control law
     """
     
     def __init__(self, config: SystemConfig, axis: str = "trolley"):
@@ -128,10 +125,11 @@ class CranePlant:
         # Build initial matrices
         self._update_matrices()
         
-        # State: [x, v, θ, θ̇]
+        # State: [x, v, θ, θ̇] for simulation
+        # Augmented state: [v, θ, θ̇, ∫e_v] for control
         self.x_full = np.zeros(4)
         self.x_integrator = 0.0
-    
+        
     def _update_matrices(self):
         """Rebuild matrices (call when m_l or L changes)"""
         self.matrices = build_plant_matrices(
@@ -155,15 +153,15 @@ class CranePlant:
     def get_augmented_state(self) -> np.ndarray:
         """Get augmented state vector [v, θ, θ̇, ∫e_v]"""
         return np.array([
-            self.x_full[1],
-            self.x_full[2],
-            self.x_full[3],
-            self.x_integrator
+            self.x_full[1],      # v
+            self.x_full[2],      # θ
+            self.x_full[3],      # θ̇
+            self.x_integrator    # ∫e_v
         ])
     
     def step(self, u: float, v_ref: float, dt: float) -> Tuple[np.ndarray, dict]:
         """
-        Integrate one timestep.
+        Integrate one timestep (for simulation).
         
         Args:
             u: Control force [lbf]
@@ -180,10 +178,10 @@ class CranePlant:
         # State derivative: ẋ = Ax + Bu
         x_dot = self.matrices.A_full @ self.x_full + self.matrices.B_full.flatten() * u_sat
         
-        # Euler integration
+        # Euler integration (could upgrade to RK4 if needed)
         self.x_full = self.x_full + x_dot * dt
         
-        # Integrator update
+        # Integrator update: accumulate velocity error
         v_error = v_ref - self.x_full[1]
         self.x_integrator = self.x_integrator + v_error * dt
         
@@ -214,3 +212,17 @@ def compute_natural_frequency(L: float) -> float:
 def compute_period(L: float) -> float:
     """Compute swing period [s] for given cable length"""
     return 2 * np.pi / compute_natural_frequency(L)
+
+
+def compute_damping_ratio(m_l: float, m_t: float, L: float, 
+                          b_x: float, c_theta: float) -> float:
+    """
+    Estimate damping ratio from system parameters.
+    This is approximate for the coupled system.
+    """
+    omega_n = compute_natural_frequency(L)
+    # Simplified: treat as SDOF pendulum with equivalent damping
+    J_eff = (m_l * L**2) / G_C
+    c_eq = c_theta + b_x * L  # Rough equivalent
+    zeta = c_eq / (2 * np.sqrt((m_l + m_t) * G_IN_PER_S2 * L))
+    return zeta

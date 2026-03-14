@@ -1,0 +1,14 @@
+ls7366r_spi_validated.py			encoder_test_3_2.py
+	Description: Original file. 200Hz, 800 pulses (one motor shaft rev), single waveform sends. This is the script that first confirmed SPI chain closure with the CD74HCT244E level shifter in place. Historical milestone file.
+
+ls7366r_encoder_motor_validated.py		encoder_test2_3_2.py
+	Teammate's update on top of mine. 800Hz, 3200 pulses (one full output shaft rev accounting for gear ratio), and adds send_pulses_chunked() to avoid pigpiod waveform size crashes. Also has better try/except cleanup in the finally block. This is the working reference for the stepper.py refactor.
+
+stepper_pigpio_validated.py			ramp_test2_3_4.py
+	Teammate's ramp upgrade (built on top of the encoder_motor work). Auto-computes START_SPEED_HZ, ACCEL_HZ_PER_S, and DECEL_HZ_PER_S from a single TARGET_SPEED_HZ constant. The most production-representative stepper script you have.
+
+lsm6ds3_spi_bringup.py				imu_bringup_test.py 
+	Minimal looping WHO_AM_I read on SPI0 CE1, Mode 3, 1MHz. Prints SUCCESS/FAILURE/UNEXPECTED based on response byte. The active bring-up script you're running against the IMU right now.
+
+lsm6ds3_spi_diag.py				imu_spi_diag.py
+	Three-step diagnostic: checks spidev devices exist, tries WHO_AM_I in both Mode 0 and Mode 3 at 100kHz, then runs a MOSI→MISO loopback test. More thorough than the bringup script — useful for isolating whether a failure is the bus, the wiring, or the chip.
