@@ -44,6 +44,7 @@ from core.config import (
 from core.controller import LQIController
 from core.reference import ManualModeGenerator
 from core.estimator import StateEstimator, SensorReadings
+from core.plant import CranePlant
 
 # Drivers
 from drivers.encoder import LS7366R, TROLLEY_ENCODER, BRIDGE_ENCODER
@@ -155,6 +156,14 @@ class CraneController:
         self._running = False
         self._last_loop_time = 0.0
         
+        # Plant model for closed-loop simulation
+        # When --sim, the plant replaces encoder/IMU with simulated dynamics
+        if self.simulation_mode:
+            self._sim_plant = CranePlant(config, axis="trolley")
+            self._sim_plant.reset()
+        else:
+            self._sim_plant = None
+        
         # Force-to-velocity integrator state [in/s]
         self._v_cmd_trolley: float = 0.0
         self._v_cmd_bridge: float = 0.0
@@ -261,6 +270,9 @@ class CraneController:
             self.stepper_trolley.enable()
         if self.stepper_bridge is not None:
             self.stepper_bridge.enable()
+        # Reset sim plant to zero state on enable
+        if self._sim_plant is not None:
+            self._sim_plant.reset()
         print("[ENABLE] Drives enabled")
     
     def disable_drives(self):
@@ -367,17 +379,29 @@ class CraneController:
         """
         Execute one control loop iteration.
         
+        In simulation mode with plant model: the LQI force drives the
+        state-space model and the plant's outputs feed back as sensor
+        data, closing the loop.  In real hardware mode: sensors and
+        estimator provide feedback as before.
+        
         Args:
             readings: Current sensor readings
         """
         dt = self.config.dt
         
-        # Update state estimator
-        v, theta, theta_dot = self.estimator.update(readings)
-        self.state.theta = theta
-        self.state.theta_dot = theta_dot
+        # -- State feedback source -----------------------------------------
+        if self._sim_plant is not None:
+            # Sim: read state directly from plant model (bypass estimator)
+            v = self.state.v_trolley      # written by plant on previous tick
+            theta = self.state.theta
+            theta_dot = self.state.theta_dot
+        else:
+            # Real hardware: use estimator (complementary filter on encoder+IMU)
+            v, theta, theta_dot = self.estimator.update(readings)
+            self.state.theta = theta
+            self.state.theta_dot = theta_dot
         
-        # Get joystick inputs
+        # -- Joystick input ------------------------------------------------
         if self.joystick is not None:
             joy_trolley = self.joystick.get_trolley_input()
             joy_bridge = self.joystick.get_bridge_input()
@@ -385,7 +409,7 @@ class CraneController:
             joy_trolley = 0.0
             joy_bridge = 0.0
         
-        # Generate velocity reference (rate-limited)
+        # -- Velocity reference (rate-limited by ManualModeGenerator) ------
         v_ref_trolley = self.ref_trolley.update(joy_trolley, dt)
         v_ref_bridge = self.ref_bridge.update(joy_bridge, dt)
         
@@ -393,7 +417,11 @@ class CraneController:
         self.state.v_ref_trolley = v_ref_trolley
         self.state.v_ref_bridge = v_ref_bridge
         
-        # Compute control outputs based on mode
+        # -- Force applied to the plant this tick --------------------------
+        # (used by the sim plant propagation at the end)
+        F_plant = 0.0
+        
+        # -- Mode-specific control -----------------------------------------
         if self.state.mode == ControlMode.MANUAL:
             # Direct velocity command, no sway control
             self.state.F_trolley = 0.0
@@ -403,9 +431,25 @@ class CraneController:
             if self.stepper_trolley is not None:
                 self.stepper_trolley.set_velocity_continuous(v_ref_trolley)
             
-            # Track v_cmd for logging consistency and bumpless transfer
+            # Track v_cmd for logging and bumpless transfer
             self._v_cmd_trolley = v_ref_trolley
             self._v_cmd_bridge = v_ref_bridge
+            
+            # Sim plant: stepper is a velocity source.  Apply a
+            # proportional servo force so the plant's trolley tracks
+            # v_ref.  This correctly excites pendulum sway from trolley
+            # acceleration.
+            #
+            # Stability constraint (Euler):  b2 * K * dt < 1.0
+            #   b2 = G_C / m_t = 386.09 / 6.7 ≈ 57.6 in/s² per lbf
+            #   K = 0.5 → 57.6 * 0.5 * 0.005 = 0.14   (stable)
+            #   convergence τ ≈ 1/(b2·K) ≈ 35ms ≈ 7 ticks
+            if self._sim_plant is not None:
+                K_SERVO = 0.5   # [lbf / (in/s)]
+                F_plant = K_SERVO * (v_ref_trolley - v)
+                F_plant = max(-self.config.trolley.f_max,
+                              min(self.config.trolley.f_max, F_plant))
+                self.state.F_trolley = F_plant
                 
         elif self.state.mode == ControlMode.AUTO:
             # Full LQR control with sway suppression
@@ -417,6 +461,7 @@ class CraneController:
                 dt=dt,
             )
             self.state.F_trolley = F_trolley
+            F_plant = F_trolley
             
             F_bridge, info = self.controller_bridge.compute(
                 v=self.state.v_bridge,
@@ -428,9 +473,6 @@ class CraneController:
             self.state.F_bridge = F_bridge
             
             # -- Force -> velocity command (trolley) -------------------------
-            #   a = F*g / (m_t + m_l)         [lbf * in/s^2 / lbm = in/s^2]
-            #   v_cmd <- v_cmd + a*dt           [in/s]
-            #   clamped to +/- v_target
             m_total_trolley = self.config.trolley.m_t + self.config.m_l
             a_trolley = (F_trolley * G_IN_PER_S2) / m_total_trolley
             self._v_cmd_trolley += a_trolley * dt
@@ -452,9 +494,17 @@ class CraneController:
             if self.stepper_bridge is not None:
                 self.stepper_bridge.set_velocity_continuous(self._v_cmd_bridge)
         
-        # Update v_cmd in state for logging
+        # -- Update state for logging --------------------------------------
         self.state.v_cmd_trolley = self._v_cmd_trolley
         self.state.v_cmd_bridge = self._v_cmd_bridge
+        
+        # -- Propagate sim plant -------------------------------------------
+        if self._sim_plant is not None:
+            x_full, plant_info = self._sim_plant.step(F_plant, v_ref_trolley, dt)
+            self.state.x_trolley = plant_info['position']
+            self.state.v_trolley = plant_info['velocity']
+            self.state.theta     = plant_info['theta_rad']
+            self.state.theta_dot = plant_info['theta_dot']
     
     def check_safety(self) -> bool:
         """
@@ -575,10 +625,11 @@ class CraneController:
                 # Read sensors
                 readings = self.read_sensors()
                 
-                # Check safety
-                if not self.check_safety():
-                    self.disable_drives()
-                    self.state.mode = ControlMode.FAULT
+                # Check safety (only when drives are active)
+                if self.state.mode in (ControlMode.MANUAL, ControlMode.AUTO):
+                    if not self.check_safety():
+                        self.disable_drives()
+                        self.state.mode = ControlMode.FAULT
                 
                 # Execute control
                 if self.state.mode in (ControlMode.MANUAL, ControlMode.AUTO):
@@ -601,9 +652,10 @@ class CraneController:
                     print(f"[WARN] Loop overrun: {self.state.loop_time_ms:.1f}ms "
                           f"> {target_dt*1000:.1f}ms")
                 
-                # Periodic status
+                # Periodic status (suppress in FAULT/DISABLED — nothing is changing)
                 if self.state.loop_count % 500 == 0:
-                    self._print_status()
+                    if self.state.mode in (ControlMode.MANUAL, ControlMode.AUTO):
+                        self._print_status()
                     
         except KeyboardInterrupt:
             print("\n[RUN] Interrupted by user")

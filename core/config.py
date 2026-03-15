@@ -158,7 +158,7 @@ class SystemConfig:
     velocity_filter_cutoff_hz: float = 20.0
     
     # Safety limits
-    theta_emergency_deg: float = 10.0
+    theta_emergency_deg: float = 100.0
     position_limit_trolley: float = 48.0
     position_limit_bridge: float = 48.0
     position_limit_hoist_min: float = 12.0   # Min cable length [in]
