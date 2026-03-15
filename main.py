@@ -18,16 +18,21 @@ Control modes:
     FAULT: Error state
 
 Usage:
-    python3 main.py                    # Normal operation
-    python3 main.py --sim              # Simulation mode (no hardware)
-    python3 main.py --test-sensors     # Sensor checkout only
-    python3 main.py --test-motors      # Motor checkout only
+    python3 main.py                           # Normal operation
+    python3 main.py --sim                     # Simulation mode (no hardware)
+    python3 main.py --sim --real-joystick     # Sim with real PS4 controller
+    python3 main.py --sim --real-joystick --log  # ... plus CSV logging
+    python3 main.py --test-sensors            # Sensor checkout only
+    python3 main.py --test-motors             # Motor checkout only
 """
 
 import sys
 import time
 import argparse
 import signal
+import csv
+import os
+from datetime import datetime
 from typing import Optional
 from dataclasses import dataclass
 
@@ -63,6 +68,14 @@ class SystemState:
     v_bridge: float = 0.0
     v_hoist: float = 0.0
     
+    # Velocity references [in/s] -- from ManualModeGenerator
+    v_ref_trolley: float = 0.0
+    v_ref_bridge: float = 0.0
+    
+    # Velocity commands [in/s] -- after force-to-velocity integrator
+    v_cmd_trolley: float = 0.0
+    v_cmd_bridge: float = 0.0
+    
     # Sway state
     theta: float = 0.0          # [rad]
     theta_dot: float = 0.0      # [rad/s]
@@ -83,16 +96,21 @@ class CraneController:
     Coordinates all subsystems and runs the control loop.
     """
     
-    def __init__(self, config: SystemConfig, simulation_mode: bool = False):
+    def __init__(self, config: SystemConfig, simulation_mode: bool = False,
+                 real_joystick: bool = False, log_csv: bool = False):
         """
         Initialize crane controller.
         
         Args:
             config: System configuration
             simulation_mode: If True, run without hardware
+            real_joystick: If True, connect to real USB joystick even in sim mode
+            log_csv: If True, write per-tick CSV log
         """
         self.config = config
         self.simulation_mode = simulation_mode
+        self.real_joystick = real_joystick
+        self.log_csv = log_csv
         self.state = SystemState()
         
         # Initialize subsystems (created but not started)
@@ -145,6 +163,11 @@ class CraneController:
         self._enable_last = False
         self._mode_last = False
         self._reset_last = False
+        
+        # CSV logger
+        self._csv_file = None
+        self._csv_writer = None
+        self._t0: float = 0.0  # Loop start epoch for relative timestamps
     
     def initialize(self) -> bool:
         """
@@ -192,12 +215,14 @@ class CraneController:
             print("  WARNING: Bridge stepper failed")
         
         # Initialize joystick
+        # With --real-joystick, connect to real USB even when rest is simulated
         print("[INIT] Joystick HMI...")
-        self.joystick = JoystickDriver(simulation_mode=self.simulation_mode)
+        joy_sim = self.simulation_mode and not self.real_joystick
+        self.joystick = JoystickDriver(simulation_mode=joy_sim)
         if not self.joystick.initialize():
             print("  WARNING: No joystick found")
             if not self.simulation_mode:
-                print("  → Connect USB gamepad for manual control")
+                print("  -> Connect USB gamepad for manual control")
         
         print()
         if success:
@@ -291,10 +316,10 @@ class CraneController:
         
         self.joystick.update()
         
-        # E-stop (immediate, no edge detection)
+        # Soft stop (held state, no edge detection)
         if self.joystick.get_estop_pressed():
             if self.state.mode != ControlMode.DISABLED:
-                print("[HMI] E-STOP pressed")
+                print("[HMI] SOFT STOP pressed")
                 self.disable_drives()
                 self.state.mode = ControlMode.DISABLED
             return
@@ -364,6 +389,10 @@ class CraneController:
         v_ref_trolley = self.ref_trolley.update(joy_trolley, dt)
         v_ref_bridge = self.ref_bridge.update(joy_bridge, dt)
         
+        # Store for status display and logging
+        self.state.v_ref_trolley = v_ref_trolley
+        self.state.v_ref_bridge = v_ref_bridge
+        
         # Compute control outputs based on mode
         if self.state.mode == ControlMode.MANUAL:
             # Direct velocity command, no sway control
@@ -374,7 +403,7 @@ class CraneController:
             if self.stepper_trolley is not None:
                 self.stepper_trolley.set_velocity_continuous(v_ref_trolley)
             
-            # Reset the force-to-velocity integrator so AUTO starts clean
+            # Track v_cmd for logging consistency and bumpless transfer
             self._v_cmd_trolley = v_ref_trolley
             self._v_cmd_bridge = v_ref_bridge
                 
@@ -398,10 +427,10 @@ class CraneController:
             )
             self.state.F_bridge = F_bridge
             
-            # ── Force → velocity command (trolley) ────────────────────────
-            #   a = F·g / (m_t + m_l)         [lbf · in/s² / lbm = in/s²]
-            #   v_cmd ← v_cmd + a·dt           [in/s]
-            #   clamped to ±v_target
+            # -- Force -> velocity command (trolley) -------------------------
+            #   a = F*g / (m_t + m_l)         [lbf * in/s^2 / lbm = in/s^2]
+            #   v_cmd <- v_cmd + a*dt           [in/s]
+            #   clamped to +/- v_target
             m_total_trolley = self.config.trolley.m_t + self.config.m_l
             a_trolley = (F_trolley * G_IN_PER_S2) / m_total_trolley
             self._v_cmd_trolley += a_trolley * dt
@@ -412,7 +441,7 @@ class CraneController:
             if self.stepper_trolley is not None:
                 self.stepper_trolley.set_velocity_continuous(self._v_cmd_trolley)
             
-            # ── Force → velocity command (bridge) ─────────────────────────
+            # -- Force -> velocity command (bridge) --------------------------
             m_total_bridge = self.config.bridge.m_t + self.config.m_l
             a_bridge = (F_bridge * G_IN_PER_S2) / m_total_bridge
             self._v_cmd_bridge += a_bridge * dt
@@ -422,6 +451,10 @@ class CraneController:
             
             if self.stepper_bridge is not None:
                 self.stepper_bridge.set_velocity_continuous(self._v_cmd_bridge)
+        
+        # Update v_cmd in state for logging
+        self.state.v_cmd_trolley = self._v_cmd_trolley
+        self.state.v_cmd_bridge = self._v_cmd_bridge
     
     def check_safety(self) -> bool:
         """
@@ -433,7 +466,7 @@ class CraneController:
         # Check sway angle
         theta_deg = abs(self.state.theta) * 180.0 / 3.14159
         if theta_deg > self.config.theta_emergency_deg:
-            print(f"[SAFETY] Sway limit exceeded: {theta_deg:.1f}°")
+            print(f"[SAFETY] Sway limit exceeded: {theta_deg:.1f} deg")
             self.state.fault_code = 2
             return False
         
@@ -450,6 +483,66 @@ class CraneController:
         
         return True
     
+    # -- CSV Logging ---------------------------------------------------------
+    
+    def _open_log(self):
+        """Open timestamped CSV log file."""
+        if not self.log_csv:
+            return
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_dir = os.path.expanduser("~/crane_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, f"run_{timestamp}.csv")
+        
+        self._csv_file = open(log_path, 'w', newline='')
+        self._csv_writer = csv.writer(self._csv_file)
+        self._csv_writer.writerow([
+            "t_s", "mode", "x_trolley", "v_trolley", "v_ref_trolley",
+            "theta_deg", "theta_dot", "F_trolley", "v_cmd_trolley",
+            "loop_ms",
+        ])
+        
+        print(f"[LOG] Writing to {log_path}")
+    
+    def _log_tick(self):
+        """Write one row of data for the current tick."""
+        if self._csv_writer is None:
+            return
+        
+        t_rel = time.time() - self._t0
+        mode_names = {
+            ControlMode.DISABLED: "DISABLED",
+            ControlMode.MANUAL: "MANUAL",
+            ControlMode.AUTO: "AUTO",
+            ControlMode.HOMING: "HOMING",
+            ControlMode.FAULT: "FAULT",
+        }
+        
+        self._csv_writer.writerow([
+            f"{t_rel:.4f}",
+            mode_names.get(self.state.mode, "UNKNOWN"),
+            f"{self.state.x_trolley:.4f}",
+            f"{self.state.v_trolley:.4f}",
+            f"{self.state.v_ref_trolley:.4f}",
+            f"{self.state.theta * 180.0 / 3.14159:.4f}",
+            f"{self.state.theta_dot:.4f}",
+            f"{self.state.F_trolley:.4f}",
+            f"{self.state.v_cmd_trolley:.4f}",
+            f"{self.state.loop_time_ms:.2f}",
+        ])
+    
+    def _close_log(self):
+        """Flush and close the CSV log."""
+        if self._csv_file is not None:
+            self._csv_file.flush()
+            self._csv_file.close()
+            self._csv_file = None
+            self._csv_writer = None
+            print("[LOG] CSV log saved and closed")
+    
+    # -- Main loop -----------------------------------------------------------
+    
     def run(self):
         """
         Main control loop.
@@ -458,11 +551,17 @@ class CraneController:
         """
         self._running = True
         target_dt = self.config.dt
+        self._t0 = time.time()
+        
+        # Open CSV log if requested
+        self._open_log()
         
         print()
         print("[RUN] Control loop starting")
         print(f"  Rate: {self.config.control_rate_hz} Hz")
         print(f"  Mode: {self.state.mode}")
+        if self.log_csv:
+            print(f"  Logging: ENABLED")
         print("  Press Ctrl+C to stop")
         print()
         
@@ -490,13 +589,17 @@ class CraneController:
                 self.state.loop_time_ms = (loop_end - loop_start) * 1000
                 self.state.loop_count += 1
                 
+                # Log this tick
+                self._log_tick()
+                
                 # Sleep to maintain rate
                 elapsed = loop_end - loop_start
                 sleep_time = target_dt - elapsed
                 if sleep_time > 0:
                     time.sleep(sleep_time)
                 elif self.state.loop_count % 100 == 0:
-                    print(f"[WARN] Loop overrun: {self.state.loop_time_ms:.1f}ms > {target_dt*1000:.1f}ms")
+                    print(f"[WARN] Loop overrun: {self.state.loop_time_ms:.1f}ms "
+                          f"> {target_dt*1000:.1f}ms")
                 
                 # Periodic status
                 if self.state.loop_count % 500 == 0:
@@ -522,7 +625,9 @@ class CraneController:
         print(f"[STATUS] Mode:{mode_str} | "
               f"X:{self.state.x_trolley:+6.2f} | "
               f"V:{self.state.v_trolley:+5.2f} | "
-              f"θ:{self.state.theta*180/3.14159:+5.2f}° | "
+              f"Vref:{self.state.v_ref_trolley:+5.2f} | "
+              f"theta:{self.state.theta*180/3.14159:+5.2f}deg | "
+              f"F:{self.state.F_trolley:+6.2f} | "
               f"Loop:{self.state.loop_time_ms:.1f}ms")
     
     def stop(self):
@@ -532,6 +637,9 @@ class CraneController:
     def shutdown(self):
         """Clean shutdown of all subsystems."""
         print("\n[SHUTDOWN] Cleaning up...")
+        
+        # Close CSV log first (before disabling drives which prints)
+        self._close_log()
         
         self.disable_drives()
         
@@ -574,7 +682,8 @@ def test_sensors(simulation_mode: bool = False):
     if imu.initialize():
         for i in range(5):
             theta, theta_dot = imu.read_angle_and_rate()
-            print(f"  {i+1}: θ={theta*180/3.14159:+6.2f}° | θ̇={theta_dot:+6.3f} rad/s")
+            print(f"  {i+1}: theta={theta*180/3.14159:+6.2f}deg | "
+                  f"theta_dot={theta_dot:+6.3f} rad/s")
             time.sleep(0.5)
     imu.close()
     
@@ -639,9 +748,16 @@ def test_motors(simulation_mode: bool = False):
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(description="UHplift Crane Control System")
-    parser.add_argument("--sim", action="store_true", help="Run in simulation mode")
-    parser.add_argument("--test-sensors", action="store_true", help="Sensor checkout")
-    parser.add_argument("--test-motors", action="store_true", help="Motor checkout")
+    parser.add_argument("--sim", action="store_true",
+                        help="Run in simulation mode (no hardware)")
+    parser.add_argument("--real-joystick", action="store_true",
+                        help="Use real USB joystick even in --sim mode")
+    parser.add_argument("--log", action="store_true",
+                        help="Write per-tick CSV log to ~/crane_logs/")
+    parser.add_argument("--test-sensors", action="store_true",
+                        help="Sensor checkout")
+    parser.add_argument("--test-motors", action="store_true",
+                        help="Motor checkout")
     args = parser.parse_args()
     
     if args.test_sensors:
@@ -654,7 +770,12 @@ def main():
     
     # Normal operation
     config = DEFAULT_CONFIG
-    controller = CraneController(config, simulation_mode=args.sim)
+    controller = CraneController(
+        config,
+        simulation_mode=args.sim,
+        real_joystick=args.real_joystick,
+        log_csv=args.log,
+    )
     
     # Handle SIGINT gracefully
     def signal_handler(sig, frame):
