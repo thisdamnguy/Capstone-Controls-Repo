@@ -5,22 +5,28 @@ Pendant-style interface for UHplift crane control
 Design intent:
     Matches the original AC pendant behavior — discrete directional commands
     at v_target, not proportional speed. The D-pad provides four digital
-    directions for trolley and bridge. Triggers provide digital hoist up/down.
-    All motion commands feed ManualModeGenerator which applies 0.20g rate
-    limiting, so motion is always smooth regardless of input being digital.
+    directions for trolley and bridge. L2/R2 buttons provide digital hoist
+    up/down. All motion commands feed ManualModeGenerator which applies 0.20g
+    rate limiting, so motion is always smooth regardless of input being digital.
 
 Validated hardware:
     Sony DualShock 4 (PS4) via USB, tested under Linux/pygame.
     D-pad reports as Hat 0 with (x, y) tuples — NOT individual buttons.
+    L2/R2 report as buttons B6/B7 — NOT analog axes.
 
-Input architecture:
-    Trolley  ← D-pad Left/Right  → Hat 0 x-component  (-1, 0, +1)
-    Bridge   ← D-pad Up/Down     → Hat 0 y-component  (-1, 0, +1)
-    Hoist    ← L2 / R2 triggers  → Axis 6 / 7         (digital: 0 or 1)
-    Enable   ← Cross    (B0)     → rising edge in main.py
-    E-stop   ← Circle   (B1)     → held state in main.py
-    Mode     ← Square   (B3)     → rising edge in main.py
-    Reset    ← Options  (B2)     → rising edge in main.py
+Confirmed PS4 mapping (verified via map_controller.py):
+    Trolley  <- D-pad Left/Right  -> Hat 0 x-component  (-1, 0, +1)
+    Bridge   <- D-pad Up/Down     -> Hat 0 y-component  (-1, 0, +1)
+    Hoist down <- L2              -> Button 6            (0 or 1)
+    Hoist up   <- R2              -> Button 7            (0 or 1)
+    Enable   <- Cross    (B0)     -> rising edge in main.py
+    Soft stop<- Circle   (B1)     -> held state in main.py
+    Mode     <- Square   (B3)     -> rising edge in main.py
+    Reset    <- Options  (B9)     -> rising edge in main.py
+
+Note: Circle (B1) is a SOFTWARE disable only. The hardware E-stop is a
+separate normally-closed AC line interlock upstream of the PSU, independent
+of software.
 
 Headless Pi:
     SDL_VIDEODRIVER and SDL_AUDIODRIVER are set to "dummy" before pygame.init()
@@ -29,7 +35,7 @@ Headless Pi:
 
 import os
 from typing import Optional, Dict, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -39,26 +45,25 @@ class JoystickConfig:
     """
     Controller mapping for pendant-style crane HMI.
 
-    Motion (trolley/bridge) comes from the D-pad hat, not analog axes.
-    Hoist comes from trigger axes that behave digitally (0 at rest, 1 when pressed).
+    Trolley and bridge use the D-pad hat — returns discrete -1, 0, +1.
+    Hoist uses L2/R2 as digital buttons — 0 at rest, 1 when pressed.
     """
 
     # ── D-pad hat ─────────────────────────────────────────────────────────────
     # D-pad reports as a hat with (x, y) tuple.
-    #   x: -1 = Left (trolley back), +1 = Right (trolley forward)
-    #   y: -1 = Down (bridge back),  +1 = Up    (bridge forward)
+    #   x: -1 = Left (trolley reverse), +1 = Right (trolley forward)
+    #   y: -1 = Down (bridge reverse),  +1 = Up    (bridge forward)
     dpad_hat_index: int = 0
 
-    # ── Hoist trigger axes (digital: rest=0, pressed=1) ───────────────────────
-    hoist_down_axis: int = 6    # L2
-    hoist_up_axis:   int = 7    # R2
-    trigger_threshold: float = 0.5   # axis value above which trigger is "pressed"
+    # ── Hoist buttons (digital: 0 at rest, 1 when pressed) ───────────────────
+    hoist_down_button: int = 6  # L2
+    hoist_up_button:   int = 7  # R2
 
     # ── Face buttons ──────────────────────────────────────────────────────────
     enable_button: int = 0      # Cross   — toggle drives on/off (edge)
-    estop_button:  int = 1      # Circle  — e-stop (held state)
-    mode_button:   int = 3      # Square  — toggle MANUAL ↔ AUTO (edge)
-    reset_button:  int = 2      # Options — clear FAULT / zero encoders (edge)
+    estop_button:  int = 1      # Circle  — software disable (held state)
+    mode_button:   int = 3      # Square  — toggle MANUAL <-> AUTO (edge)
+    reset_button:  int = 9      # Options — fault reset / zero encoders (edge)
 
 
 # ── Driver ────────────────────────────────────────────────────────────────────
@@ -68,11 +73,11 @@ class JoystickDriver:
     Pendant-style USB game controller driver for crane HMI.
 
     Primary interface for the 200 Hz control loop:
-        update()              — call once per tick to latch current state
-        get_trolley_input()   — returns -1, 0, or +1  (D-pad Left/Right)
-        get_bridge_input()    — returns -1, 0, or +1  (D-pad Down/Up)
-        get_hoist_input()     — returns -1, 0, or +1  (L2 down / R2 up)
-        get_*_pressed()       — button state booleans (edge detection in main.py)
+        update()               -- call once per tick to latch current state
+        get_trolley_input()    -- returns -1, 0, or +1  (D-pad Left/Right)
+        get_bridge_input()     -- returns -1, 0, or +1  (D-pad Down/Up)
+        get_hoist_input()      -- returns -1, 0, or +1  (L2 down / R2 up)
+        get_*_pressed()        -- button state booleans (edge detection in main.py)
     """
 
     def __init__(self,
@@ -81,7 +86,7 @@ class JoystickDriver:
         """
         Args:
             config: Axis/button mapping. Defaults to validated PS4 mapping.
-            simulation_mode: Skip pygame entirely; use set_sim_inputs() for testing.
+            simulation_mode: Skip pygame; use set_sim_inputs() for testing.
         """
         self.config = config or JoystickConfig()
         self.simulation_mode = simulation_mode
@@ -91,9 +96,9 @@ class JoystickDriver:
         self._connected: bool = False
 
         # Latched hardware state (updated each update() call)
-        self._axes:    Dict[int, float]        = {}
-        self._buttons: Dict[int, bool]         = {}
-        self._hats:    Dict[int, Tuple[int,int]] = {}
+        self._axes:    Dict[int, float]           = {}
+        self._buttons: Dict[int, bool]            = {}
+        self._hats:    Dict[int, Tuple[int, int]] = {}
 
         # Simulation overrides
         self._sim_trolley: float = 0.0
@@ -106,8 +111,8 @@ class JoystickDriver:
         """
         Initialize pygame and connect to the first available joystick.
 
-        Sets SDL_VIDEODRIVER and SDL_AUDIODRIVER to "dummy" before pygame.init()
-        so this works on a headless Raspberry Pi with no display attached.
+        Sets SDL environment variables for headless Pi operation before
+        calling pygame.init().
 
         Returns:
             True if a joystick was found and initialized.
@@ -116,8 +121,6 @@ class JoystickDriver:
             print("[JOYSTICK] Simulation mode — no hardware required")
             return True
 
-        # Must be set before pygame.init() or the display subsystem will fail
-        # on a headless Pi.
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
         os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
@@ -130,7 +133,7 @@ class JoystickDriver:
             count = pygame.joystick.get_count()
             if count == 0:
                 print("[JOYSTICK] No controller found")
-                print("  → Connect a USB gamepad and re-run")
+                print("  -> Connect a USB gamepad and re-run")
                 return False
 
             self._joystick = pygame.joystick.Joystick(0)
@@ -144,21 +147,15 @@ class JoystickDriver:
             print(f"[JOYSTICK] Connected: {name}")
             print(f"  Axes: {num_axes} | Buttons: {num_buttons} | Hats: {num_hats}")
 
-            # Warn if the controller doesn't match what was validated
-            name_lower = name.lower()
-            if 'playstation' not in name_lower and 'dualshock' not in name_lower \
-                    and 'wireless controller' not in name_lower:
-                print(f"  [WARN] Controller not a PS4 DualShock — mapping may need "
-                      f"adjustment. Run map_controller.py to verify.")
-
             if num_hats == 0:
-                print("  [WARN] No hat/D-pad detected. Trolley and bridge will not respond.")
+                print("  [WARN] No hat/D-pad detected. "
+                      "Trolley and bridge will not respond.")
 
             self._connected = True
             return True
 
         except ImportError:
-            print("[JOYSTICK] pygame not installed — run: pip install pygame")
+            print("[JOYSTICK] pygame not installed -- run: pip install pygame")
             return False
         except Exception as e:
             print(f"[JOYSTICK] Initialization failed: {e}")
@@ -212,13 +209,13 @@ class JoystickDriver:
         Returns:
             +1.0  D-pad Right pressed  (forward, +X)
             -1.0  D-pad Left  pressed  (reverse, -X)
-             0.0  D-pad neutral or Up/Down only
+             0.0  D-pad neutral
         """
         if self.simulation_mode:
             return self._sim_trolley
 
         hat = self._hats.get(self.config.dpad_hat_index, (0, 0))
-        return float(hat[0])   # x component
+        return float(hat[0])
 
     def get_bridge_input(self) -> float:
         """
@@ -227,60 +224,58 @@ class JoystickDriver:
         Returns:
             +1.0  D-pad Up   pressed  (forward, +Y)
             -1.0  D-pad Down pressed  (reverse, -Y)
-             0.0  D-pad neutral or Left/Right only
+             0.0  D-pad neutral
         """
         if self.simulation_mode:
             return self._sim_bridge
 
         hat = self._hats.get(self.config.dpad_hat_index, (0, 0))
-        return float(hat[1])   # y component
+        return float(hat[1])
 
     def get_hoist_input(self) -> float:
         """
-        Hoist velocity command from L2 (down) and R2 (up) triggers.
+        Hoist velocity command from L2 (down) and R2 (up).
 
-        PS4 triggers rest at 0 and go to 1 when fully pressed.
-        Treated as digital: any value above trigger_threshold = fully on.
+        Both are digital buttons: 0 at rest, 1 when pressed.
 
         Returns:
-            +1.0  R2 pressed  (hoist up,   +Z)
-            -1.0  L2 pressed  (hoist down, -Z)
-             0.0  neither pressed (or both — no net command)
+            +1.0  R2 (B7) pressed  (hoist up,   +Z)
+            -1.0  L2 (B6) pressed  (hoist down, -Z)
+             0.0  neither or both pressed
         """
         if self.simulation_mode:
             return self._sim_hoist
 
-        thr = self.config.trigger_threshold
-        down = 1.0 if self._axes.get(self.config.hoist_down_axis, 0.0) > thr else 0.0
-        up   = 1.0 if self._axes.get(self.config.hoist_up_axis,   0.0) > thr else 0.0
+        down = 1.0 if self._buttons.get(self.config.hoist_down_button, False) else 0.0
+        up   = 1.0 if self._buttons.get(self.config.hoist_up_button,   False) else 0.0
         return up - down
 
     # ── Button state ──────────────────────────────────────────────────────────
-    # These return the raw held state.
-    # Edge detection (rising-edge "just pressed") is handled in main.py
-    # using _enable_last, _mode_last, _reset_last flags.
-    # E-stop is intentionally held-state: active as long as Circle is held.
 
     def get_enable_pressed(self) -> bool:
-        """Cross (B0) — enable/disable drives. Edge-detected in main.py."""
+        """Cross (B0) -- enable/disable drives. Edge-detected in main.py."""
         if self.simulation_mode:
             return False
         return self._buttons.get(self.config.enable_button, False)
 
     def get_estop_pressed(self) -> bool:
-        """Circle (B1) — software e-stop. Held state: active while held."""
+        """
+        Circle (B1) -- software disable. Held state: active while held.
+        NOTE: NOT the hardware E-stop. Hardware E-stop is a separate
+        normally-closed AC line interlock independent of software.
+        """
         if self.simulation_mode:
             return False
         return self._buttons.get(self.config.estop_button, False)
 
     def get_mode_pressed(self) -> bool:
-        """Square (B3) — toggle MANUAL ↔ AUTO. Edge-detected in main.py."""
+        """Square (B3) -- toggle MANUAL <-> AUTO. Edge-detected in main.py."""
         if self.simulation_mode:
             return False
         return self._buttons.get(self.config.mode_button, False)
 
     def get_reset_pressed(self) -> bool:
-        """Options (B2) — clear FAULT / zero encoders. Edge-detected in main.py."""
+        """Options (B9) -- clear FAULT / zero encoders. Edge-detected in main.py."""
         if self.simulation_mode:
             return False
         return self._buttons.get(self.config.reset_button, False)
@@ -288,9 +283,7 @@ class JoystickDriver:
     # ── Diagnostics ───────────────────────────────────────────────────────────
 
     def get_all_inputs(self) -> Dict:
-        """
-        Snapshot of all crane inputs. Useful for logging and --test-sensors.
-        """
+        """Snapshot of all crane inputs. Useful for logging and --test-sensors."""
         return {
             'trolley': self.get_trolley_input(),
             'bridge':  self.get_bridge_input(),
@@ -302,10 +295,7 @@ class JoystickDriver:
         }
 
     def get_raw_state(self) -> Dict:
-        """
-        Full raw hardware state for debugging.
-        Returns axes, buttons, and hats as read from pygame.
-        """
+        """Full raw hardware state for debugging."""
         return {
             'axes':    dict(self._axes),
             'buttons': dict(self._buttons),
@@ -318,14 +308,7 @@ class JoystickDriver:
                        trolley: float = 0.0,
                        bridge:  float = 0.0,
                        hoist:   float = 0.0) -> None:
-        """
-        Inject simulated motion commands for software-only testing.
-
-        Args:
-            trolley: -1.0, 0.0, or +1.0
-            bridge:  -1.0, 0.0, or +1.0
-            hoist:   -1.0, 0.0, or +1.0
-        """
+        """Inject simulated motion commands for software-only testing."""
         self._sim_trolley = float(trolley)
         self._sim_bridge  = float(bridge)
         self._sim_hoist   = float(hoist)
@@ -335,66 +318,36 @@ class JoystickDriver:
         return self._connected or self.simulation_mode
 
 
-# ── Controller profiles ───────────────────────────────────────────────────────
+# ── Controller profile ────────────────────────────────────────────────────────
 
 def detect_controller_type(name: str) -> JoystickConfig:
     """
-    Return a JoystickConfig for the detected controller name.
+    Return a JoystickConfig for the detected controller name string.
 
     Only the PS4 DualShock 4 mapping has been hardware-validated.
-    Other entries are best-guess based on typical pygame hat/button layouts —
-    always run map_controller.py to verify before first use.
-
-    Args:
-        name: Controller name string from pygame (joy.get_name())
-
-    Returns:
-        JoystickConfig appropriate for the detected controller.
+    Run map_controller.py to verify before use on any other controller.
     """
     name_lower = name.lower()
 
-    if 'playstation' in name_lower \
-            or 'dualshock' in name_lower \
-            or 'dualsense' in name_lower \
-            or 'wireless controller' in name_lower:
+    if any(k in name_lower for k in
+           ['playstation', 'dualshock', 'dualsense', 'wireless controller']):
         # ── Sony DualShock 4 / PS4 ── VALIDATED ──────────────────────────────
         # Confirmed via map_controller.py on Linux/pygame:
-        #   D-pad  → Hat 0  (x=trolley, y=bridge)
-        #   L2/R2  → Axis 6 / Axis 7  (digital: rest=0, pressed=1)
-        #   Cross  → Button 0   Circle → Button 1
-        #   Square → Button 3   Options → Button 2
+        #   D-pad   -> Hat 0  (x = trolley, y = bridge)
+        #   L2/R2   -> Buttons 6 / 7  (digital: 0 at rest, 1 pressed)
+        #   Cross   -> Button 0    Circle  -> Button 1
+        #   Square  -> Button 3    Options -> Button 9
         return JoystickConfig(
             dpad_hat_index=0,
-            hoist_down_axis=6,
-            hoist_up_axis=7,
-            trigger_threshold=0.5,
-            enable_button=0,    # Cross
-            estop_button=1,     # Circle
-            mode_button=3,      # Square
-            reset_button=2,     # Options
-        )
-
-    elif 'xbox' in name_lower:
-        # ── Xbox controller ── NOT VALIDATED ─────────────────────────────────
-        # Xbox D-pad typically also reports as Hat 0 under Linux xinput.
-        # Triggers are analog axes (rest=-1, pressed=+1) — trigger_threshold
-        # of 0.0 converts them to digital at centre.
-        # Run map_controller.py to confirm before use.
-        print(f"[JOYSTICK] Xbox controller detected — mapping is unvalidated. "
-              f"Run map_controller.py to verify.")
-        return JoystickConfig(
-            dpad_hat_index=0,
-            hoist_down_axis=2,   # LT — verify with map_controller.py
-            hoist_up_axis=5,     # RT — verify with map_controller.py
-            trigger_threshold=0.0,  # Xbox triggers rest at -1; 0.0 = midpoint
-            enable_button=0,     # A
-            estop_button=1,      # B
-            mode_button=2,       # X
-            reset_button=7,      # Start
+            hoist_down_button=6,
+            hoist_up_button=7,
+            enable_button=0,
+            estop_button=1,
+            mode_button=3,
+            reset_button=9,
         )
 
     else:
-        # ── Unknown controller ────────────────────────────────────────────────
-        print(f"[JOYSTICK] Unknown controller '{name}' — using PS4 defaults. "
+        print(f"[JOYSTICK] Unknown controller '{name}' -- using PS4 defaults. "
               f"Run map_controller.py to verify mapping.")
         return JoystickConfig()
