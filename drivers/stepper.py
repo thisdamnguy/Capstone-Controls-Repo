@@ -159,7 +159,7 @@ class StepperDriver:
             self._enabled = True
             return
         
-        self._pi.write(self.config.ena_pin, 1)
+        self._pi.write(self.config.ena_pin, 0) # active low
         print(f"[STEPPER:{self.config.name}] ENA asserted, waiting {T1_ENA_DIR_MS}ms...")
         time.sleep(T1_ENA_DIR_MS / 1000.0)
         self._enabled = True
@@ -169,7 +169,7 @@ class StepperDriver:
         """Disable motor driver and stop any active transmission."""
         self._stop_transmission()
         if self._pi is not None:
-            self._pi.write(self.config.ena_pin, 0)
+            self._pi.write(self.config.ena_pin, 1) 
         self._enabled = False
         print(f"[STEPPER:{self.config.name}] Driver DISABLED")
     
@@ -210,7 +210,7 @@ class StepperDriver:
         if abs(velocity_in_s) < self.config.v_min_in_s:
             self._stop_transmission()
             return
-        
+                
         # ── Determine desired direction and frequency ─────────────────────
         desired_forward = (velocity_in_s > 0.0)
         freq_hz = abs(velocity_in_s) / self.config.inches_per_pulse
@@ -225,7 +225,8 @@ class StepperDriver:
             # ~50-100µs on Linux, well within the ≤100µs budget and well
             # above the 2µs minimum.
             time.sleep(T2_DIR_PUL_US / 1_000_000)
-        
+
+
         # ── Skip rebuild if frequency unchanged ───────────────────────────
         if half_period_us == self._last_half_period_us and self._transmitting:
             return
@@ -289,7 +290,8 @@ class StepperDriver:
             pulse_list.append(pigpio.pulse(0, pin_mask, half_period_us))
         
         self._pi.wave_add_generic(pulse_list)
-        return self._pi.wave_create()
+        wid = self._pi.wave_create()
+        return wid
     
     # ══════════════════════════════════════════════════════════════════════════
     # Blocking ramp API  (homing / --test-motors ONLY)

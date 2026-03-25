@@ -91,8 +91,8 @@ class LSM6DS3:
     def __init__(self,
                  config: Optional[LSM6DS3Config] = None,
                  simulation_mode: bool = False,
-                 spi_bus: int = 0,
-                 spi_ce: int = 1):    # CE1 = GPIO7
+                 spi_bus: int = 1,  # SPI1 on Raspberry Pi
+                 spi_ce: int = 0):    # CE0 = GPIO18
         """
         Initialize IMU driver.
         
@@ -133,8 +133,8 @@ class LSM6DS3:
         try:
             self._spi = spidev.SpiDev()
             self._spi.open(self.spi_bus, self.spi_ce)
+            self._spi.mode = 0b00  # Mode 0: - SPI1 aux controller rejects Mode 3
             self._spi.max_speed_hz = 1_000_000  # 1 MHz
-            self._spi.mode = 0b11  # Mode 3: CPOL=1, CPHA=1
             
             # Step 1: Verify WHO_AM_I
             who_am_i = self._read_register(REG_WHO_AM_I)

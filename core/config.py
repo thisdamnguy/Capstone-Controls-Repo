@@ -24,19 +24,19 @@ ENCODER_CALIBRATION = {
     'trolley': {
         'counts_per_rev': 4000,      # 1000 PPR × 4 quadrature
         'gear_ratio': 5.0,           # 5:1 gearbox
-        'wheel_diameter_in': 1.5,    # Drive wheel diameter [in]
+        'wheel_diameter_in': 1.0,    # Drive wheel diameter [in]
         'in_per_count': 0.000152,    # Calibrated [in/count]
     },
     'bridge': {
         'counts_per_rev': 4000,
         'gear_ratio': 4.0,           # 4:1 gearbox
-        'wheel_diameter_in': 2.0,
+        'wheel_diameter_in': 1.0,
         'in_per_count': 0.000190,
     },
     'hoist': {
         'counts_per_rev': 4000,
         'gear_ratio': 10.0,          # 10:1 gearbox
-        'wheel_diameter_in': 1.5,    # Drum diameter
+        'wheel_diameter_in': 1.0,    # Drum diameter
         'in_per_count': 0.000118,
     },
 }
@@ -64,7 +64,7 @@ MOTOR_SPECS = {
         rated_current_a=2.0,
         holding_torque_ozfin=79.30,
         gear_ratio=5.0,
-        v_target_in_s=4.9,
+        v_target_in_s=0.25,
     ),
     'bridge': MotorSpec(
         name="bridge",
@@ -72,7 +72,7 @@ MOTOR_SPECS = {
         rated_current_a=1.5,
         holding_torque_ozfin=63.73,
         gear_ratio=4.0,
-        v_target_in_s=8.3,
+        v_target_in_s=8.0,
     ),
     'hoist': MotorSpec(
         name="hoist",

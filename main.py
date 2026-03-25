@@ -198,7 +198,6 @@ class CraneController:
         self.encoder_trolley = LS7366R(TROLLEY_ENCODER, self.simulation_mode)
         if not self.encoder_trolley.initialize():
             print("  WARNING: Trolley encoder failed")
-            success = False
         
         self.encoder_bridge = LS7366R(BRIDGE_ENCODER, self.simulation_mode)
         if not self.encoder_bridge.initialize():
@@ -430,10 +429,14 @@ class CraneController:
             # Drive trolley at joystick-commanded velocity
             if self.stepper_trolley is not None:
                 self.stepper_trolley.set_velocity_continuous(v_ref_trolley)
+
+            if self.stepper_bridge is not None:
+                self.stepper_bridge.set_velocity_continuous(v_ref_bridge)  # ← add this
             
             # Track v_cmd for logging and bumpless transfer
             self._v_cmd_trolley = v_ref_trolley
             self._v_cmd_bridge = v_ref_bridge
+            
             
             # Sim plant: stepper is a velocity source.  Apply a
             # proportional servo force so the plant's trolley tracks
