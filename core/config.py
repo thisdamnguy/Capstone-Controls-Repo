@@ -64,7 +64,7 @@ MOTOR_SPECS = {
         rated_current_a=2.0,
         holding_torque_ozfin=79.30,
         gear_ratio=5.0,
-        v_target_in_s=0.25,
+        v_target_in_s=4.0,
     ),
     'bridge': MotorSpec(
         name="bridge",
@@ -72,7 +72,7 @@ MOTOR_SPECS = {
         rated_current_a=1.5,
         holding_torque_ozfin=63.73,
         gear_ratio=4.0,
-        v_target_in_s=8.0,
+        v_target_in_s=2.5,
     ),
     'hoist': MotorSpec(
         name="hoist",
